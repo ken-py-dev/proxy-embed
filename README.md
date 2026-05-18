@@ -15,6 +15,7 @@
 | **Real IP detection** | Accurately identifies client IPs behind CDNs, load balancers, and Vercel/Cloudflare — no misattribution |
 | **WebSocket passthrough** | Proxies WebSocket connections with the same rate limiting and IP filtering as HTTP |
 | **CORS for everyone** | Wildcard CORS headers on every response — any frontend can talk to your backend |
+| **Attack detection** | Per-IP-per-path abuse detection with auto-de-escalating cache absorption — slows down attackers automatically |
 | **Production ready** | Auto-restart on crash, memory-safe IP tracking (capped at 100k), periodic cleanup of stale data |
 
 ## Project Structure
@@ -48,6 +49,9 @@ An Express server that acts as a middleman between clients and backend services:
 - **Streaming** — Optimized headers for SSE (`text/event-stream`) and streaming JSON
 - **WebSocket** — Upgrade passthrough with rate limiting and IP filtering
 - **Caching** — Smart `Cache-Control` headers based on content type
+- **Attack detection** — Per-IP-per-path request tracking with adaptive time windows. When an IP exceeds the attack threshold on a specific path, the path enters **cache absorption mode** — JSON responses get a short cache TTL to protect the backend
+- **Auto-de-escalation** — Cache punishment automatically expires after `CACHE_PUNISHMENT_TTL` seconds without further attacks
+- **OOM protection** — Memory-safe tracking with caps on tracked IPs (`MAX_TRACKED_IPS`, `MAX_TRACKED_PATH_IPS`) and oldest-entry eviction
 
 ### 3. Cloudflare Worker (`workers.js`)
 
@@ -58,6 +62,7 @@ Same functionality deployed at the edge via Cloudflare Workers, plus:
 - **Range requests** — Partial content support for media streaming (`206 Partial Content`)
 - **WebSocket pass-through** — Proxy WebSocket upgrade requests to origin servers
 - **Cloudflare optimizations** — Polish (lossy image compression), Mirage (lazy loading), cache everything
+- **Attack detection** — Per-IP-per-path abuse monitoring with cache absorption and auto-de-escalation (same as Express)
 
 ## Quick Start
 
@@ -130,6 +135,7 @@ const ORIGIN_URLS = [
 | `BAN_THRESHOLD` | Violations before auto-ban | `3` |
 | `BAN_DURATION_MS` | Auto-ban duration (ms) | `900000` (15 min) |
 | `MAX_TRACKED_IPS` | Max tracked IPs in memory | `100000` |
+| `MAX_TRACKED_PATH_IPS` | Max tracked IP-path pairs in memory (attack detection) | `50000` |
 | `PID` | Set to `"0"` to disable auto-restart | — |
 
 ## Rate Limiting & IP Blocking
@@ -139,6 +145,17 @@ const ORIGIN_URLS = [
 - Expired bans and stale tracking data are cleaned up every 15 seconds
 - Trusted/internal proxy IPs bypass all rate limiting and blocking
 
+## Attack Detection & Cache Absorption
+
+In addition to per-IP rate limiting, the proxy includes a **per-IP-per-path attack detection** system:
+
+- Every request tracks its **IP + path** combo with timestamps within a sliding time window
+- Media paths (`.m3u8`, `.mp4`, `.jpg`, etc.) use a **12-hour window**; all other paths use a **300-second window**
+- When a single IP exceeds **500 requests** on the same path within the window, the path is flagged as **under attack**
+- **Cache absorption** — JSON responses on attacked paths receive a short `Cache-Control: max-age=300` (instead of no caching), causing CDNs and browsers to serve stale cached responses and reduce backend load
+- **Auto-de-escalation** — After 300 seconds without further attack activity on a path, the cache punishment is automatically lifted
+- **OOM protection** — Both `ipRequests` and `ipPathTimestamps` maps are capped (`MAX_TRACKED_IPS` and `MAX_TRACKED_PATH_IPS`), with oldest entries evicted when limits are reached
+
 ### Behavior by Platform
 
 | Action | Express (proxy.js) | Workers (workers.js) |
@@ -146,6 +163,7 @@ const ORIGIN_URLS = [
 | Rate limited | Socket destroyed | `429 Too Many Requests` |
 | Banned | HTTP redirect to `http://{ip}` | `429 Too Many Requests` |
 | Blocklisted | HTTP redirect to `http://{ip}` | `403 Forbidden` |
+| Attack detected | Cache absorption (300s TTL on JSON) | Cache absorption (300s TTL on JSON) |
 
 > **Note:** The Express version redirects banned IPs to their own IP address as a probing mechanism (to detect when the IP comes back online). The Worker version returns proper HTTP status codes.
 
@@ -186,6 +204,7 @@ Both deployments apply content-type-aware `Cache-Control` headers:
 | HTML | 1 hour | — |
 | API / JSON / SSE | No cache | `/api/*` paths, `.json` |
 | Error responses (non-200/206) | No cache | — |
+| Attack-detected paths (JSON only) | 5 minutes | Cache absorber active |
 | Range requests | 1 hour | — |
 
 ## Deployments
