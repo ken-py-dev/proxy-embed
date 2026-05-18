@@ -8,6 +8,14 @@ let proxyUrls = [];
 let blockedIps = ['72.60.237.246'];
 let internalProxyIps = ["162.220.234.134"];
 
+const pathsUnderAttack = new Map();
+const pathRequestTimestamps = new Map();
+
+const ATTACK_CONFIG = {
+    RATE_THRESHOLD_PER_PATH: 500,
+    CACHE_PUNISHMENT_TTL: 300
+};
+
 try {
     const configPath = "./proxy-config.json";
     if (fs.existsSync(configPath)) {
@@ -163,6 +171,53 @@ const ensureCapacity = (ip) => {
     }
 };
 
+const recordPathRequest = (path) => {
+    const now = Date.now();
+    
+    if (!pathRequestTimestamps.has(path)) {
+        pathRequestTimestamps.set(path, []);
+    }
+    
+    const timestamps = pathRequestTimestamps.get(path);
+    timestamps.push(now);
+    
+    const cutoff = now - 2000;
+    while (timestamps.length > 0 && timestamps[0] < cutoff) {
+        timestamps.shift();
+    }
+    
+    const ratePerSecond = timestamps.length / 2;
+    
+    if (ratePerSecond >= ATTACK_CONFIG.RATE_THRESHOLD_PER_PATH) {
+        if (!pathsUnderAttack.has(path)) {
+            pathsUnderAttack.set(path, {
+                active: true,
+                rate: ratePerSecond,
+                triggeredAt: now
+            });
+            console.log(`ATTACK DETECTED on ${path} | Rate: ${ratePerSecond} req/sec - CACHE PUNISHMENT ACTIVATED (${ATTACK_CONFIG.CACHE_PUNISHMENT_TTL}s)`);
+        }
+    }
+};
+
+setInterval(() => {
+    const now = Date.now();
+    const cutoff = now - 5000;
+    
+    for (const [path, timestamps] of pathRequestTimestamps) {
+        while (timestamps.length > 0 && timestamps[0] < cutoff) {
+            timestamps.shift();
+        }
+        if (timestamps.length === 0) {
+            pathRequestTimestamps.delete(path);
+        }
+    }
+}, 5000);
+
+const isPathUnderAttack = (path) => {
+    return pathsUnderAttack.has(path);
+};
+
 const getCacheTtl = (url, contentType, hasRangeHeader, statusCode) => {
     const pathname = url.toLowerCase();
     
@@ -175,45 +230,14 @@ const getCacheTtl = (url, contentType, hasRangeHeader, statusCode) => {
     }
     
     if (contentType.includes('text/event-stream')) {
-    return 0; 
+        return 0;
     }
     
     if (contentType.includes('application/json')) {
-    return 60;
-   }
-    
-    if (contentType.includes('text/html') || 
-        contentType.includes('application/javascript') || 
-        contentType.includes('text/css') || 
-        contentType.includes('text/plain') || 
-        contentType.includes('text/xml')) {
-        return 3600;
-    }
-    
-    if (pathname.endsWith('.m3u8') || 
-        contentType.includes('application/vnd.apple.mpegurl') || 
-        contentType.includes('application/x-mpegurl')) {
-        return 43200;
-    }
-    
-    if (pathname.endsWith('.mpd') || contentType.includes('application/dash+xml')) {
-        return 43200;
-    }
-    
-    if (pathname.endsWith('.ts') || pathname.endsWith('.m4s')) {
-        return 43200;
-    }
-    
-    if (pathname.match(/\.(jpg|jpeg|png|gif|webp|bmp|svg|ico)$/i)) {
-        return 43200;
-    }
-    
-    if (pathname.match(/\.(mp3|wav|ogg|m4a|flac|aac)$/i)) {
-        return 43200;
-    }
-    
-    if (pathname.match(/\.(mp4|webm|avi|mov|mkv)$/i)) {
-        return 43200;
+        if (isPathUnderAttack(pathname)) {
+            return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL;
+        }
+        return 0;
     }
     
     return 0;
@@ -222,7 +246,6 @@ const getCacheTtl = (url, contentType, hasRangeHeader, statusCode) => {
 const app = express();
 
 app.set('trust proxy', true);
-
 app.disable('etag');
 
 const getClientIp = (req) => {
@@ -275,6 +298,9 @@ const getClientIp = (req) => {
 
 app.use((req, res, next) => {
     req.clientIp = getClientIp(req);
+    
+    const path = new URL(req.url, 'http://localhost').pathname;
+    recordPathRequest(path);
 
     if (trustedIps.has(req.clientIp) || internalProxyIpSet.has(req.clientIp)) {
         next();
@@ -328,8 +354,6 @@ const tryNextProxy = () => {
         currentProxyIndex = (currentProxyIndex + 1) % proxyUrls.length;
         currentProxy = proxyUrls[currentProxyIndex];
         console.log(`Switching to proxy: ${currentProxy}`);
-    } else {
-        console.log(`Only one proxy available, cannot rotate: ${currentProxy}`);
     }
 };
 
@@ -468,7 +492,8 @@ const server = app.listen(port, () => {
     console.log(`Proxy server running on port ${port}`);
     console.log(`Available proxies: ${proxyUrls.join(', ')}`);
     console.log(`Current proxy: ${currentProxy}`);
-    console.log(`Proxy rotation: ${proxyUrls.length > 1 ? 'Enabled' : 'Disabled (single proxy only)'}`);
+    console.log(`Proxy rotation: ${proxyUrls.length > 1 ? 'Enabled' : 'Disabled'}`);
+    console.log(`Attack threshold: ${ATTACK_CONFIG.RATE_THRESHOLD_PER_PATH} req/sec`);
 });
 
 server.on('upgrade', (req, socket, head) => {

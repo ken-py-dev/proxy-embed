@@ -22,6 +22,14 @@ const violationCounts = new Map();
 const trustedIps = new Set();
 const internalProxyIps = new Set(INTERNAL_PROXY_IPS);
 
+const pathsUnderAttack = new Map();
+const pathRequestTimestamps = new Map();
+
+const ATTACK_CONFIG = {
+    RATE_THRESHOLD_PER_PATH: 500,
+    CACHE_PUNISHMENT_TTL: 300
+};
+
 const cleanMaps = () => {
     const now = Date.now();
     const cutoff = now - RATE_LIMIT_WINDOW_MS;
@@ -64,6 +72,53 @@ const ensureCapacity = (ip) => {
         }
     }
 };
+
+const recordPathRequest = (path) => {
+    const now = Date.now();
+    
+    if (!pathRequestTimestamps.has(path)) {
+        pathRequestTimestamps.set(path, []);
+    }
+    
+    const timestamps = pathRequestTimestamps.get(path);
+    timestamps.push(now);
+    
+    const cutoff = now - 2000;
+    while (timestamps.length > 0 && timestamps[0] < cutoff) {
+        timestamps.shift();
+    }
+    
+    const ratePerSecond = timestamps.length / 2;
+    
+    if (ratePerSecond >= ATTACK_CONFIG.RATE_THRESHOLD_PER_PATH) {
+        if (!pathsUnderAttack.has(path)) {
+            pathsUnderAttack.set(path, {
+                active: true,
+                rate: ratePerSecond,
+                triggeredAt: now
+            });
+            console.log(`ATTACK DETECTED on ${path} | Rate: ${ratePerSecond} req/sec - CACHE PUNISHMENT ACTIVATED (${ATTACK_CONFIG.CACHE_PUNISHMENT_TTL}s)`);
+        }
+    }
+};
+
+const isPathUnderAttack = (path) => {
+    return pathsUnderAttack.has(path);
+};
+
+setInterval(() => {
+    const now = Date.now();
+    const cutoff = now - 5000;
+    
+    for (const [path, timestamps] of pathRequestTimestamps) {
+        while (timestamps.length > 0 && timestamps[0] < cutoff) {
+            timestamps.shift();
+        }
+        if (timestamps.length === 0) {
+            pathRequestTimestamps.delete(path);
+        }
+    }
+}, 5000);
 
 function recordViolation(ip) {
   const count = (violationCounts.get(ip) || 0) + 1;
@@ -136,8 +191,14 @@ function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus) {
     return 3600;
   }
   
-  if (responseContentType.includes('application/json') ||
-      responseContentType.includes('text/event-stream')) {
+  if (responseContentType.includes('text/event-stream')) {
+    return 0;
+  }
+
+  if (responseContentType.includes('application/json')) {
+    if (isPathUnderAttack(pathname)) {
+      return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL;
+    }
     return 0;
   }
   
@@ -336,6 +397,8 @@ export default {
       if (requestCount % 100 === 0) cleanMaps();
 
       const clientIP = getClientIp(request);
+      const requestPathname = new URL(request.url).pathname.toLowerCase();
+      recordPathRequest(requestPathname);
 
       if (trustedIps.has(clientIP) || internalProxyIps.has(clientIP)) {
         return await proxyRequestToOrigin(request, clientIP);
