@@ -9,11 +9,22 @@ let blockedIps = ['72.60.237.246'];
 let internalProxyIps = ["162.220.234.134"];
 
 const pathsUnderAttack = new Map();
-const pathRequestTimestamps = new Map();
+const ipPathTimestamps = new Map();
 
 const ATTACK_CONFIG = {
-    RATE_THRESHOLD_PER_PATH: 500,
     CACHE_PUNISHMENT_TTL: 300
+};
+
+const IP_PATH_ATTACK_THRESHOLD = 500;
+
+const getTrackingWindowMs = (pathname) => {
+    const lower = pathname.toLowerCase();
+    
+    if (lower.match(/\.(m3u8|mpd|ts|m4s|jpg|jpeg|png|gif|webp|bmp|svg|ico|mp3|wav|ogg|m4a|flac|aac|mp4|webm|avi|mov|mkv)$/)) {
+        return 43200 * 1000;
+    }
+    
+    return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
 };
 
 try {
@@ -171,48 +182,63 @@ const ensureCapacity = (ip) => {
     }
 };
 
-const recordPathRequest = (path) => {
+const recordPathRequest = (ip, path) => {
     const now = Date.now();
+    const windowMs = getTrackingWindowMs(path);
     
-    if (!pathRequestTimestamps.has(path)) {
-        pathRequestTimestamps.set(path, []);
+    if (!ipPathTimestamps.has(ip)) {
+        ipPathTimestamps.set(ip, new Map());
     }
     
-    const timestamps = pathRequestTimestamps.get(path);
+    const pathTimestamps = ipPathTimestamps.get(ip);
+    
+    if (!pathTimestamps.has(path)) {
+        pathTimestamps.set(path, []);
+    }
+    
+    const timestamps = pathTimestamps.get(path);
     timestamps.push(now);
     
-    const cutoff = now - 2000;
+    const cutoff = now - windowMs;
     while (timestamps.length > 0 && timestamps[0] < cutoff) {
         timestamps.shift();
     }
     
-    const ratePerSecond = timestamps.length / 2;
+    const count = timestamps.length;
     
-    if (ratePerSecond >= ATTACK_CONFIG.RATE_THRESHOLD_PER_PATH) {
+    if (count >= IP_PATH_ATTACK_THRESHOLD) {
         if (!pathsUnderAttack.has(path)) {
             pathsUnderAttack.set(path, {
                 active: true,
-                rate: ratePerSecond,
-                triggeredAt: now
+                count: count,
+                ip: ip,
+                triggeredAt: now,
+                windowMs: windowMs
             });
-            console.log(`ATTACK DETECTED on ${path} | Rate: ${ratePerSecond} req/sec - CACHE PUNISHMENT ACTIVATED (${ATTACK_CONFIG.CACHE_PUNISHMENT_TTL}s)`);
+            console.log(`ATTACK DETECTED on ${path} | IP: ${ip} | Count: ${count} requests in ${windowMs/1000}s window - CACHE PUNISHMENT ACTIVATED (${ATTACK_CONFIG.CACHE_PUNISHMENT_TTL}s)`);
         }
     }
 };
 
 setInterval(() => {
     const now = Date.now();
-    const cutoff = now - 5000;
     
-    for (const [path, timestamps] of pathRequestTimestamps) {
-        while (timestamps.length > 0 && timestamps[0] < cutoff) {
-            timestamps.shift();
+    for (const [ip, pathTimestamps] of ipPathTimestamps) {
+        for (const [path, timestamps] of pathTimestamps) {
+            const windowMs = getTrackingWindowMs(path);
+            const cutoff = now - windowMs;
+            while (timestamps.length > 0 && timestamps[0] < cutoff) {
+                timestamps.shift();
+            }
+            if (timestamps.length === 0) {
+                pathTimestamps.delete(path);
+            }
         }
-        if (timestamps.length === 0) {
-            pathRequestTimestamps.delete(path);
+        if (pathTimestamps.size === 0) {
+            ipPathTimestamps.delete(ip);
         }
     }
-}, 5000);
+}, 15000);
 
 const isPathUnderAttack = (path) => {
     return pathsUnderAttack.has(path);
@@ -328,7 +354,7 @@ app.use((req, res, next) => {
     req.clientIp = getClientIp(req);
     
     const path = new URL(req.url, 'http://localhost').pathname;
-    recordPathRequest(path);
+    recordPathRequest(req.clientIp, path);
 
     if (trustedIps.has(req.clientIp) || internalProxyIpSet.has(req.clientIp)) {
         next();
@@ -521,7 +547,7 @@ const server = app.listen(port, () => {
     console.log(`Available proxies: ${proxyUrls.join(', ')}`);
     console.log(`Current proxy: ${currentProxy}`);
     console.log(`Proxy rotation: ${proxyUrls.length > 1 ? 'Enabled' : 'Disabled'}`);
-    console.log(`Attack threshold: ${ATTACK_CONFIG.RATE_THRESHOLD_PER_PATH} req/sec`);
+    console.log(`Attack threshold: ${IP_PATH_ATTACK_THRESHOLD} requests per IP per path (window = cache TTL)`);
 });
 
 server.on('upgrade', (req, socket, head) => {
