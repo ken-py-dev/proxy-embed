@@ -13,6 +13,7 @@ const MAX_REQUESTS_PER_WINDOW = 200;
 const BAN_THRESHOLD = 3;
 const BAN_DURATION_MS = 900000;
 const MAX_TRACKED_IPS = 100000;
+const MAX_TRACKED_PATH_IPS = 50000;
 
 let requestCount = 0;
 
@@ -84,11 +85,36 @@ const ensureCapacity = (ip) => {
     }
 };
 
+const ensurePathCapacity = (ip) => {
+    if (ipPathTimestamps.has(ip)) return;
+    if (ipPathTimestamps.size >= MAX_TRACKED_PATH_IPS) {
+        let oldest = null;
+        let oldestTime = Infinity;
+        for (const [entryIp, pathTimestamps] of ipPathTimestamps) {
+            let lastTime = 0;
+            for (const timestamps of pathTimestamps.values()) {
+                if (timestamps.length > 0) {
+                    const t = timestamps[timestamps.length - 1];
+                    if (t > lastTime) lastTime = t;
+                }
+            }
+            if (lastTime < oldestTime) {
+                oldestTime = lastTime;
+                oldest = entryIp;
+            }
+        }
+        if (oldest) {
+            ipPathTimestamps.delete(oldest);
+        }
+    }
+};
+
 const recordPathRequest = (ip, path) => {
     const now = Date.now();
     const windowMs = getTrackingWindowMs(path);
     
     if (!ipPathTimestamps.has(ip)) {
+        ensurePathCapacity(ip);
         ipPathTimestamps.set(ip, new Map());
     }
     
@@ -151,6 +177,19 @@ setInterval(() => {
             }
         }
         if (pathTimestamps.size === 0) {
+            ipPathTimestamps.delete(ip);
+        }
+    }
+    
+    if (ipPathTimestamps.size > MAX_TRACKED_PATH_IPS) {
+        const excess = [...ipPathTimestamps.entries()]
+            .sort((a, b) => {
+                const aLast = Math.max(...Array.from(a[1].values(), t => t[t.length - 1] || 0));
+                const bLast = Math.max(...Array.from(b[1].values(), t => t[t.length - 1] || 0));
+                return aLast - bLast;
+            })
+            .slice(0, ipPathTimestamps.size - MAX_TRACKED_PATH_IPS);
+        for (const [ip] of excess) {
             ipPathTimestamps.delete(ip);
         }
     }
