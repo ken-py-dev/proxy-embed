@@ -21,7 +21,7 @@ const CACHE_CONFIG = {
   FULL_TTL: 604800,
   MANIFEST_TTL: 43200,
   ATTACK_PUNISHMENT_TTL: 300,
-  CHUNK_SIZE: 1024 * 1024
+  CHUNK_SIZE: 5 * 1024 * 1024
 };
 
 const ipRequests = new Map();
