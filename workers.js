@@ -32,12 +32,6 @@ const ATTACK_CONFIG = {
 
 const IP_PATH_ATTACK_THRESHOLD = 500;
 
-function getMediaPath(pathname, ext) {
-    if (!ext) return pathname;
-    const cleanExt = ext.startsWith('.') ? ext : '.' + ext;
-    return pathname + cleanExt.toLowerCase();
-}
-
 const getTrackingWindowMs = () => {
     return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
 };
@@ -255,15 +249,14 @@ const getClientIp = (request) => {
   return 'unknown';
 };
 
-function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus, ext) {
-  const originalPathname = url.pathname.toLowerCase();
-  const pathname = getMediaPath(originalPathname, ext);
+function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus) {
+  const pathname = url.pathname.toLowerCase();
   
   if (responseContentType.includes('application/json') && isPathUnderAttack(originalPathname)) {
     return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL;
   }
   
-  if (responseStatus !== 200 && responseStatus !== 206) {
+  if (responseStatus < 200 && responseStatus >= 400) {
       return 0;
   }
   
