@@ -22,6 +22,89 @@ const violationCounts = new Map();
 const trustedIps = new Set();
 const internalProxyIps = new Set(INTERNAL_PROXY_IPS);
 
+const pathsUnderAttack = new Map();
+const ipPathTimestamps = new Map();
+
+const ATTACK_CONFIG = {
+    CACHE_PUNISHMENT_TTL: 300
+};
+
+const IP_PATH_ATTACK_THRESHOLD = 500;
+const MAX_TRACKED_PATH_IPS = 50000;
+
+const getTrackingWindowMs = () => {
+    return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
+};
+
+const isPathUnderAttack = (path) => {
+    return pathsUnderAttack.has(path);
+};
+
+const ensurePathCapacity = (ip) => {
+    if (ipPathTimestamps.has(ip)) return;
+    if (ipPathTimestamps.size >= MAX_TRACKED_PATH_IPS) {
+        let oldest = null;
+        let oldestTime = Infinity;
+        for (const [entryIp, pathTimestamps] of ipPathTimestamps) {
+            let lastTime = 0;
+            for (const timestamps of pathTimestamps.values()) {
+                if (timestamps.length > 0) {
+                    const t = timestamps[timestamps.length - 1];
+                    if (t > lastTime) lastTime = t;
+                }
+            }
+            if (lastTime < oldestTime) {
+                oldestTime = lastTime;
+                oldest = entryIp;
+            }
+        }
+        if (oldest) {
+            ipPathTimestamps.delete(oldest);
+        }
+    }
+};
+
+const recordPathRequest = (ip, path) => {
+    const now = Date.now();
+    const windowMs = getTrackingWindowMs();
+    
+    if (!ipPathTimestamps.has(ip)) {
+        ensurePathCapacity(ip);
+        ipPathTimestamps.set(ip, new Map());
+    }
+    
+    const pathTimestamps = ipPathTimestamps.get(ip);
+    
+    if (!pathTimestamps.has(path)) {
+        pathTimestamps.set(path, []);
+    }
+    
+    const timestamps = pathTimestamps.get(path);
+    timestamps.push(now);
+    
+    const cutoff = now - windowMs;
+    while (timestamps.length > 0 && timestamps[0] < cutoff) {
+        timestamps.shift();
+    }
+    
+    const count = timestamps.length;
+    
+    if (count >= IP_PATH_ATTACK_THRESHOLD) {
+        if (!pathsUnderAttack.has(path)) {
+            pathsUnderAttack.set(path, {
+                active: true,
+                count: count,
+                ip: ip,
+                triggeredAt: now,
+                windowMs: windowMs
+            });
+            console.log(`ATTACK DETECTED on ${path} | IP: ${ip} | Count: ${count} requests in ${windowMs/1000}s window - CACHE PUNISHMENT ACTIVATED (${ATTACK_CONFIG.CACHE_PUNISHMENT_TTL}s)`);
+        } else {
+            pathsUnderAttack.get(path).triggeredAt = now;
+        }
+    }
+};
+
 const cleanMaps = () => {
     const now = Date.now();
     const cutoff = now - RATE_LIMIT_WINDOW_MS;
@@ -42,6 +125,41 @@ const cleanMaps = () => {
         for (const [ip] of excess) {
             ipRequests.delete(ip);
             violationCounts.delete(ip);
+        }
+    }
+    
+    // Clean up attack detection maps
+    const punishCutoff = now - ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
+    for (const [path, attack] of pathsUnderAttack) {
+        if (attack.triggeredAt < punishCutoff) {
+            console.log(`ATTACK DE-ESCALATED on ${path} - cache punishment expired`);
+            pathsUnderAttack.delete(path);
+        }
+    }
+    for (const [ip, pathTimestamps] of ipPathTimestamps) {
+        for (const [path, timestamps] of pathTimestamps) {
+            const cutoff2 = now - getTrackingWindowMs();
+            while (timestamps.length > 0 && timestamps[0] < cutoff2) {
+                timestamps.shift();
+            }
+            if (timestamps.length === 0) {
+                pathTimestamps.delete(path);
+            }
+        }
+        if (pathTimestamps.size === 0) {
+            ipPathTimestamps.delete(ip);
+        }
+    }
+    if (ipPathTimestamps.size > MAX_TRACKED_PATH_IPS) {
+        const excess = [...ipPathTimestamps.entries()]
+            .sort((a, b) => {
+                const aLast = Math.max(...Array.from(a[1].values(), t => t[t.length - 1] || 0));
+                const bLast = Math.max(...Array.from(b[1].values(), t => t[t.length - 1] || 0));
+                return aLast - bLast;
+            })
+            .slice(0, ipPathTimestamps.size - MAX_TRACKED_PATH_IPS);
+        for (const [ip] of excess) {
+            ipPathTimestamps.delete(ip);
         }
     }
 };
@@ -136,8 +254,15 @@ function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus, e
     return 3600;
   }
   
-  if (responseContentType.includes('application/json') ||
-      responseContentType.includes('text/event-stream')) {
+  if (responseContentType.includes('application/json')) {
+    // Under attack? Cache briefly to reduce origin load (cache punishment)
+    if (isPathUnderAttack(pathname)) {
+      return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL;
+    }
+    return 0;
+  }
+  
+  if (responseContentType.includes('text/event-stream')) {
     return 0;
   }
   
@@ -340,6 +465,9 @@ export default {
       if (requestCount % 100 === 0) cleanMaps();
 
       const clientIP = getClientIp(request);
+      
+      const url = new URL(request.url);
+      recordPathRequest(clientIP, url.pathname);
 
       if (trustedIps.has(clientIP) || internalProxyIps.has(clientIP)) {
         return await proxyRequestToOrigin(request, clientIP);
