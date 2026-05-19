@@ -300,7 +300,7 @@ const getCacheTtl = (url, contentType, hasRangeHeader, statusCode) => {
         return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL;
     }
     
-    if (statusCode < 200 || statusCode >= 400) {
+    if (statusCode !== 200 && statusCode !== 206) {
         return 0;
     }
     
