@@ -13,7 +13,6 @@ const MAX_REQUESTS_PER_WINDOW = 200;
 const BAN_THRESHOLD = 3;
 const BAN_DURATION_MS = 900000;
 const MAX_TRACKED_IPS = 100000;
-const MAX_TRACKED_PATH_IPS = 50000;
 
 let requestCount = 0;
 
@@ -22,19 +21,6 @@ const bannedIps = new Map();
 const violationCounts = new Map();
 const trustedIps = new Set();
 const internalProxyIps = new Set(INTERNAL_PROXY_IPS);
-
-const pathsUnderAttack = new Map();
-const ipPathTimestamps = new Map();
-
-const ATTACK_CONFIG = {
-    CACHE_PUNISHMENT_TTL: 300
-};
-
-const IP_PATH_ATTACK_THRESHOLD = 500;
-
-const getTrackingWindowMs = () => {
-    return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
-};
 
 const cleanMaps = () => {
     const now = Date.now();
@@ -78,116 +64,6 @@ const ensureCapacity = (ip) => {
         }
     }
 };
-
-const ensurePathCapacity = (ip) => {
-    if (ipPathTimestamps.has(ip)) return;
-    if (ipPathTimestamps.size >= MAX_TRACKED_PATH_IPS) {
-        let oldest = null;
-        let oldestTime = Infinity;
-        for (const [entryIp, pathTimestamps] of ipPathTimestamps) {
-            let lastTime = 0;
-            for (const timestamps of pathTimestamps.values()) {
-                if (timestamps.length > 0) {
-                    const t = timestamps[timestamps.length - 1];
-                    if (t > lastTime) lastTime = t;
-                }
-            }
-            if (lastTime < oldestTime) {
-                oldestTime = lastTime;
-                oldest = entryIp;
-            }
-        }
-        if (oldest) {
-            ipPathTimestamps.delete(oldest);
-        }
-    }
-};
-
-const recordPathRequest = (ip, path) => {
-    const now = Date.now();
-    const windowMs = getTrackingWindowMs();
-    
-    if (!ipPathTimestamps.has(ip)) {
-        ensurePathCapacity(ip);
-        ipPathTimestamps.set(ip, new Map());
-    }
-    
-    const pathTimestamps = ipPathTimestamps.get(ip);
-    
-    if (!pathTimestamps.has(path)) {
-        pathTimestamps.set(path, []);
-    }
-    
-    const timestamps = pathTimestamps.get(path);
-    timestamps.push(now);
-    
-    const cutoff = now - windowMs;
-    while (timestamps.length > 0 && timestamps[0] < cutoff) {
-        timestamps.shift();
-    }
-    
-    const count = timestamps.length;
-    
-    if (count >= IP_PATH_ATTACK_THRESHOLD) {
-        if (!pathsUnderAttack.has(path)) {
-            pathsUnderAttack.set(path, {
-                active: true,
-                count: count,
-                ip: ip,
-                triggeredAt: now,
-                windowMs: windowMs
-            });
-            console.log(`ATTACK DETECTED on ${path} | IP: ${ip} | Count: ${count} requests in ${windowMs/1000}s window - CACHE PUNISHMENT ACTIVATED (${ATTACK_CONFIG.CACHE_PUNISHMENT_TTL}s)`);
-        } else {
-            pathsUnderAttack.get(path).triggeredAt = now;
-        }
-    }
-};
-
-const isPathUnderAttack = (path) => {
-    return pathsUnderAttack.has(path);
-};
-
-setInterval(() => {
-    const now = Date.now();
-    const punishCutoff = now - ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
-    
-    for (const [path, attack] of pathsUnderAttack) {
-        if (attack.triggeredAt < punishCutoff) {
-            console.log(`ATTACK DE-ESCALATED on ${path} - cache punishment expired`);
-            pathsUnderAttack.delete(path);
-        }
-    }
-    
-    for (const [ip, pathTimestamps] of ipPathTimestamps) {
-        for (const [path, timestamps] of pathTimestamps) {
-            const windowMs = getTrackingWindowMs();
-            const cutoff = now - windowMs;
-            while (timestamps.length > 0 && timestamps[0] < cutoff) {
-                timestamps.shift();
-            }
-            if (timestamps.length === 0) {
-                pathTimestamps.delete(path);
-            }
-        }
-        if (pathTimestamps.size === 0) {
-            ipPathTimestamps.delete(ip);
-        }
-    }
-    
-    if (ipPathTimestamps.size > MAX_TRACKED_PATH_IPS) {
-        const excess = [...ipPathTimestamps.entries()]
-            .sort((a, b) => {
-                const aLast = Math.max(...Array.from(a[1].values(), t => t[t.length - 1] || 0));
-                const bLast = Math.max(...Array.from(b[1].values(), t => t[t.length - 1] || 0));
-                return aLast - bLast;
-            })
-            .slice(0, ipPathTimestamps.size - MAX_TRACKED_PATH_IPS);
-        for (const [ip] of excess) {
-            ipPathTimestamps.delete(ip);
-        }
-    }
-}, 15000);
 
 function recordViolation(ip) {
   const count = (violationCounts.get(ip) || 0) + 1;
@@ -252,16 +128,17 @@ const getClientIp = (request) => {
 function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus) {
   const pathname = url.pathname.toLowerCase();
   
-  if (responseContentType.includes('application/json') && isPathUnderAttack(pathname)) {
-    return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL;
-  }
-  
-  if (responseStatus < 200 && responseStatus >= 400) {
-      return 0;
+  if (responseStatus !== 200 && responseStatus !== 206) {
+    return 0;
   }
   
   if (hasRangeHeader) {
     return 3600;
+  }
+  
+  if (responseContentType.includes('application/json') ||
+      responseContentType.includes('text/event-stream')) {
+    return 0;
   }
   
   if (responseContentType.includes('text/html') || 
@@ -314,7 +191,7 @@ async function proxyFetch(url, request, clientIP, rangeHeader, noCache) {
   };
   
   if (!noCache) {
-    cfSettings.cacheEverything = true;
+    cfSettings.cacheEverything = false;
   }
 
   let lastErrorResponse = null;
@@ -434,9 +311,8 @@ async function proxyRequestToOrigin(request, clientIP) {
   resHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Accept, X-Stream, Range');
   resHeaders.set('Access-Control-Expose-Headers', '*');
 
-  const ext = url.searchParams.get('ext') || undefined;
-  const cacheTtl = getCacheTtl(url, contentType, !!rangeHeader, response.status, ext);
-  const shouldCache = cacheTtl > 0;
+  const cacheTtl = getCacheTtl(url, contentType, !!rangeHeader, response.status);
+  const shouldCache = cacheTtl > 0 && (response.status === 200 || response.status === 206);
 
   if (shouldCache) {
     resHeaders.set('Cache-Control', `public, max-age=${cacheTtl}, stale-while-revalidate=${Math.floor(cacheTtl/2)}`);
@@ -460,8 +336,6 @@ export default {
       if (requestCount % 100 === 0) cleanMaps();
 
       const clientIP = getClientIp(request);
-      const requestPathname = new URL(request.url).pathname.toLowerCase();
-      recordPathRequest(clientIP, requestPathname);
 
       if (trustedIps.has(clientIP) || internalProxyIps.has(clientIP)) {
         return await proxyRequestToOrigin(request, clientIP);
