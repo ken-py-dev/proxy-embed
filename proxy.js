@@ -2,7 +2,7 @@ const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 const axios = require("axios");
 const fs = require("fs");
-const WebSocket = require("ws");
+const NodeCache = require("node-cache");
 
 let proxyUrls = [];
 let blockedIps = ['72.60.237.246'];
@@ -93,6 +93,8 @@ const bannedIps = new Map();
 const violationCounts = new Map();
 const trustedIps = new Set();
 const probingIntervals = new Map();
+
+const responseCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 
 const startProbingIp = (ip) => {
     if (probingIntervals.has(ip)) return;
@@ -310,7 +312,6 @@ const getCacheTtl = (url, contentType, hasRangeHeader, statusCode, ext) => {
         return 3600;
     }
     
-    // Check ext query param (?ext=.m3u8) alongside pathname
     const effectivePath = ext ? pathname + ext.toLowerCase() : pathname;
     
     if (effectivePath.endsWith('.m3u8') || 
@@ -516,6 +517,21 @@ app.use(
             }
         },
         onProxyRes: (proxyRes, req, res) => {
+            const cacheKey = `${req.method}:${req.url}`;
+            const cachedResponse = responseCache.get(cacheKey);
+            
+            if (cachedResponse && !isStreamingRequest(req)) {
+                res.setHeader('X-Cache', 'HIT');
+                res.setHeader('Cache-Control', cachedResponse.headers['Cache-Control']);
+                res.setHeader('access-control-allow-origin', '*');
+                res.setHeader('access-control-allow-methods', 'GET, POST, PUT, DELETE, OPTIONS');
+                res.setHeader('access-control-allow-headers', 'Content-Type, Authorization, X-Requested-With, Accept, X-Stream');
+                res.setHeader('access-control-expose-headers', '*');
+                res.status(cachedResponse.statusCode);
+                res.send(cachedResponse.body);
+                return;
+            }
+            
             delete proxyRes.headers['x-railway-edge'];
             delete proxyRes.headers['x-railway-request-id'];
             proxyRes.headers['access-control-allow-origin'] = '*';
@@ -532,29 +548,43 @@ app.use(
             const cacheTtl = getCacheTtl(url, contentType, hasRangeHeader, statusCode, ext);
             const shouldCache = cacheTtl > 0;
             
-            if (shouldCache && !isStreamingRequest(req)) {
-                proxyRes.headers['Cache-Control'] = `public, max-age=${cacheTtl}, stale-while-revalidate=${Math.floor(cacheTtl/2)}`;
-                proxyRes.headers['X-Cache'] = 'MISS';
-                proxyRes.headers['CDN-Cache-Control'] = `public, max-age=${cacheTtl}`;
-                proxyRes.headers['Vary'] = 'Accept-Encoding';
-            } else if (isStreamingRequest(req)) {
-                proxyRes.headers['cache-control'] = 'no-cache, no-transform, must-revalidate';
-                proxyRes.headers['x-accel-buffering'] = 'no';
-                proxyRes.headers['cf-cache-status'] = 'DYNAMIC';
-                proxyRes.headers['connection'] = 'keep-alive';
-                delete proxyRes.headers['content-length'];
-            } else {
-                proxyRes.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate';
-                proxyRes.headers['CDN-Cache-Control'] = 'no-cache, no-store, must-revalidate';
-            }
-            
-            if (statusCode === 206) {
-                const contentRange = proxyRes.headers['content-range'];
-                if (contentRange) {
-                    proxyRes.headers['content-range'] = contentRange;
+            let bodyChunks = [];
+            proxyRes.on('data', chunk => bodyChunks.push(chunk));
+            proxyRes.on('end', () => {
+                const responseBody = Buffer.concat(bodyChunks);
+                
+                if (shouldCache && !isStreamingRequest(req) && statusCode === 200) {
+                    responseCache.set(cacheKey, {
+                        body: responseBody,
+                        headers: proxyRes.headers,
+                        statusCode: statusCode
+                    }, cacheTtl);
+                    proxyRes.headers['X-Cache'] = 'MISS';
+                    proxyRes.headers['Cache-Control'] = `public, max-age=${cacheTtl}, stale-while-revalidate=${Math.floor(cacheTtl/2)}`;
+                    proxyRes.headers['CDN-Cache-Control'] = `public, max-age=${cacheTtl}`;
+                    proxyRes.headers['Vary'] = 'Accept-Encoding';
+                } else if (isStreamingRequest(req)) {
+                    proxyRes.headers['cache-control'] = 'no-cache, no-transform, must-revalidate';
+                    proxyRes.headers['x-accel-buffering'] = 'no';
+                    proxyRes.headers['cf-cache-status'] = 'DYNAMIC';
+                    proxyRes.headers['connection'] = 'keep-alive';
+                    delete proxyRes.headers['content-length'];
+                } else {
+                    proxyRes.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate';
+                    proxyRes.headers['CDN-Cache-Control'] = 'no-cache, no-store, must-revalidate';
                 }
-                proxyRes.headers['accept-ranges'] = 'bytes';
-            }
+                
+                if (statusCode === 206) {
+                    const contentRange = proxyRes.headers['content-range'];
+                    if (contentRange) {
+                        proxyRes.headers['content-range'] = contentRange;
+                    }
+                    proxyRes.headers['accept-ranges'] = 'bytes';
+                }
+                
+                res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                res.end(responseBody);
+            });
         },
         onError: (err, req, res) => {
             const statusCode = err.code === 'ECONNREFUSED' ? 502 :
@@ -597,119 +627,3 @@ const server = app.listen(port, () => {
     console.log(`Proxy rotation: ${proxyUrls.length > 1 ? 'Enabled' : 'Disabled'}`);
     console.log(`Attack threshold: ${IP_PATH_ATTACK_THRESHOLD} requests per IP per path (window = cache TTL)`);
 });
-
-server.on('upgrade', (req, socket, head) => {
-    const clientIp = getClientIp(req);
-    
-    if (trustedIps.has(clientIp) || internalProxyIpSet.has(clientIp)) {
-        handleWebSocketUpgrade(req, socket, head, clientIp);
-        return;
-    }
-    
-    if (isBanned(clientIp) || blockedIps.includes(clientIp)) {
-        socket.destroy();
-        return;
-    }
-    
-    const now = Date.now();
-    if (!ipRequests.has(clientIp)) {
-        ensureCapacity(clientIp);
-        ipRequests.set(clientIp, []);
-    }
-    const timestamps = ipRequests.get(clientIp);
-    const windowStart = now - RATE_LIMIT_WINDOW_MS;
-    while (timestamps.length > 0 && timestamps[0] < windowStart) {
-        timestamps.shift();
-    }
-    if (timestamps.length >= MAX_REQUESTS_PER_WINDOW) {
-        recordViolation(clientIp);
-        socket.destroy();
-        return;
-    }
-    timestamps.push(now);
-    
-    handleWebSocketUpgrade(req, socket, head, clientIp);
-});
-
-function handleWebSocketUpgrade(req, socket, head, clientIp) {
-    let wsConnection = null;
-    let lastError = null;
-    
-    for (const proxyUrl of proxyUrls) {
-        try {
-            const targetUrl = new URL(proxyUrl);
-            targetUrl.protocol = 'wss:';
-            targetUrl.pathname = req.url;
-            
-            const headers = {
-                'X-Client-IP': clientIp,
-                'X-Forwarded-For': clientIp,
-                'X-Real-IP': clientIp,
-                'Host': targetUrl.host,
-                'User-Agent': req.headers['user-agent'] || '',
-                'Accept': req.headers['accept'] || '',
-                'Accept-Language': req.headers['accept-language'] || '',
-                'Origin': req.headers['origin'] || '',
-                'Connection': 'Upgrade',
-                'Upgrade': 'websocket'
-            };
-            
-            if (req.headers['x-is-internal'] === 'true') {
-                trustedIps.add(clientIp);
-                headers['x-is-internal'] = 'true';
-            }
-            
-            wsConnection = new WebSocket(targetUrl.toString(), {
-                headers: headers
-            });
-            
-            wsConnection.on('open', () => {
-                if (head && head.length > 0) {
-                    wsConnection.send(head);
-                }
-                
-                socket.on('data', (data) => {
-                    if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
-                        wsConnection.send(data);
-                    }
-                });
-                
-                wsConnection.on('message', (data) => {
-                    if (socket.writable) {
-                        socket.write(data);
-                    }
-                });
-            });
-            
-            wsConnection.on('error', (err) => {
-                lastError = err;
-                if (wsConnection) wsConnection.close();
-            });
-            
-            wsConnection.on('close', () => {
-                if (socket && !socket.destroyed) {
-                    socket.end();
-                }
-            });
-            
-            socket.on('error', (err) => {
-                if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
-                    wsConnection.close();
-                }
-            });
-            
-            socket.on('close', () => {
-                if (wsConnection && wsConnection.readyState === WebSocket.OPEN) {
-                    wsConnection.close();
-                }
-            });
-            
-            return;
-        } catch (error) {
-            lastError = error;
-            continue;
-        }
-    }
-    
-    socket.destroy();
-}

@@ -32,6 +32,8 @@ const ATTACK_CONFIG = {
 const IP_PATH_ATTACK_THRESHOLD = 500;
 const MAX_TRACKED_PATH_IPS = 50000;
 
+const responseCache = new Map();
+
 const getTrackingWindowMs = () => {
     return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
 };
@@ -128,7 +130,6 @@ const cleanMaps = () => {
         }
     }
     
-    // Clean up attack detection maps
     const punishCutoff = now - ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
     for (const [path, attack] of pathsUnderAttack) {
         if (attack.triggeredAt < punishCutoff) {
@@ -160,6 +161,13 @@ const cleanMaps = () => {
             .slice(0, ipPathTimestamps.size - MAX_TRACKED_PATH_IPS);
         for (const [ip] of excess) {
             ipPathTimestamps.delete(ip);
+        }
+    }
+    
+    const cacheCutoff = now - 43200000;
+    for (const [key, cached] of responseCache) {
+        if (cached.timestamp < cacheCutoff) {
+            responseCache.delete(key);
         }
     }
 };
@@ -255,7 +263,6 @@ function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus, e
   }
   
   if (responseContentType.includes('application/json')) {
-    // Under attack? Cache briefly to reduce origin load (cache punishment)
     if (isPathUnderAttack(pathname)) {
       return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL;
     }
@@ -274,7 +281,6 @@ function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus, e
     return 3600;
   }
   
-  // Check ext query param (?ext=.m3u8) alongside pathname
   const effectivePath = ext ? pathname + ext.toLowerCase() : pathname;
   
   if (effectivePath.endsWith('.m3u8') || 
@@ -308,6 +314,17 @@ function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus, e
 }
 
 async function proxyFetch(url, request, clientIP, rangeHeader, noCache) {
+  const cacheKey = `${request.method}:${url.pathname}${url.search}`;
+  const cachedResponse = responseCache.get(cacheKey);
+  
+  if (cachedResponse && !noCache) {
+    const isExpired = Date.now() > cachedResponse.expiry;
+    if (!isExpired) {
+      return cachedResponse.response;
+    }
+    responseCache.delete(cacheKey);
+  }
+  
   const newHeaders = new Headers(request.headers);
   newHeaders.set('x-forwarded-for', clientIP);
   newHeaders.set('x-real-ip', clientIP);
@@ -442,21 +459,43 @@ async function proxyRequestToOrigin(request, clientIP) {
   const ext = url.searchParams.get('ext') || undefined;
   const cacheTtl = getCacheTtl(url, contentType, !!rangeHeader, response.status, ext);
   const shouldCache = cacheTtl > 0 && (response.status === 200 || response.status === 206);
+  const cacheKey = `${request.method}:${url.pathname}${url.search}`;
+  const wasCached = responseCache.has(cacheKey) && !noCache;
 
   if (shouldCache) {
     resHeaders.set('Cache-Control', `public, max-age=${cacheTtl}, stale-while-revalidate=${Math.floor(cacheTtl/2)}`);
-    resHeaders.set('CF-Cache-Status', 'MISS');
-    resHeaders.set('X-Cache', 'MISS');
+    resHeaders.set('CF-Cache-Status', wasCached ? 'HIT' : 'MISS');
+    resHeaders.set('X-Cache', wasCached ? 'HIT' : 'MISS');
   } else {
     resHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   }
 
-  return new Response(response.body, {
+  const responseBody = await response.arrayBuffer();
+  
+  if (shouldCache && !noCache && !wasCached) {
+    const clonedResponse = new Response(responseBody, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: resHeaders
+    });
+    
+    responseCache.set(cacheKey, {
+      response: clonedResponse,
+      expiry: Date.now() + (cacheTtl * 1000),
+      timestamp: Date.now()
+    });
+  }
+
+  return new Response(responseBody, {
     status: response.status,
     statusText: response.statusText,
     headers: resHeaders
   });
 }
+
+setInterval(() => {
+  cleanMaps();
+}, 15000);
 
 export default {
   async fetch(request, env, ctx) {
