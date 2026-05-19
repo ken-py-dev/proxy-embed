@@ -10,9 +10,14 @@ const RATE_LIMIT_WINDOW_MS = 60000;
 const MAX_REQUESTS_PER_WINDOW = 200;
 const BAN_THRESHOLD = 3;
 const BAN_DURATION_MS = 900000;
-const MAX_TRACKED_IPS = 100000;
 
-let requestCount = 0;
+const CACHE_CONFIG = {
+  SEGMENT_TTL: 86400,
+  PARTIAL_TTL: 3600,
+  FULL_TTL: 604800,
+  MANIFEST_TTL: 43200,
+  ATTACK_PUNISHMENT_TTL: 300
+};
 
 const ipRequests = new Map();
 const bannedIps = new Map();
@@ -23,168 +28,95 @@ const internalProxyIps = new Set(INTERNAL_PROXY_IPS);
 const pathsUnderAttack = new Map();
 const ipPathTimestamps = new Map();
 
-const ATTACK_CONFIG = {
-    CACHE_PUNISHMENT_TTL: 300
-};
-
 const IP_PATH_ATTACK_THRESHOLD = 500;
-const MAX_TRACKED_PATH_IPS = 50000;
 
 const getTrackingWindowMs = () => {
-    return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
+  return CACHE_CONFIG.ATTACK_PUNISHMENT_TTL * 1000;
 };
 
 const isPathUnderAttack = (path) => {
-    return pathsUnderAttack.has(path);
-};
-
-const ensurePathCapacity = (ip) => {
-    if (ipPathTimestamps.has(ip)) return;
-    if (ipPathTimestamps.size >= MAX_TRACKED_PATH_IPS) {
-        let oldest = null;
-        let oldestTime = Infinity;
-        for (const [entryIp, pathTimestamps] of ipPathTimestamps) {
-            let lastTime = 0;
-            for (const timestamps of pathTimestamps.values()) {
-                if (timestamps.length > 0) {
-                    const t = timestamps[timestamps.length - 1];
-                    if (t > lastTime) lastTime = t;
-                }
-            }
-            if (lastTime < oldestTime) {
-                oldestTime = lastTime;
-                oldest = entryIp;
-            }
-        }
-        if (oldest) {
-            ipPathTimestamps.delete(oldest);
-        }
-    }
+  return pathsUnderAttack.has(path);
 };
 
 const recordPathRequest = (ip, path) => {
-    const now = Date.now();
-    const windowMs = getTrackingWindowMs();
-    
-    if (!ipPathTimestamps.has(ip)) {
-        ensurePathCapacity(ip);
-        ipPathTimestamps.set(ip, new Map());
+  const now = Date.now();
+  const windowMs = getTrackingWindowMs();
+  
+  if (!ipPathTimestamps.has(ip)) {
+    ipPathTimestamps.set(ip, new Map());
+  }
+  
+  const pathTimestamps = ipPathTimestamps.get(ip);
+  
+  if (!pathTimestamps.has(path)) {
+    pathTimestamps.set(path, []);
+  }
+  
+  const timestamps = pathTimestamps.get(path);
+  timestamps.push(now);
+  
+  const cutoff = now - windowMs;
+  while (timestamps.length > 0 && timestamps[0] < cutoff) {
+    timestamps.shift();
+  }
+  
+  const count = timestamps.length;
+  
+  if (count >= IP_PATH_ATTACK_THRESHOLD) {
+    if (!pathsUnderAttack.has(path)) {
+      pathsUnderAttack.set(path, {
+        active: true,
+        count: count,
+        ip: ip,
+        triggeredAt: now,
+        windowMs: windowMs
+      });
+    } else {
+      pathsUnderAttack.get(path).triggeredAt = now;
     }
-    
-    const pathTimestamps = ipPathTimestamps.get(ip);
-    
-    if (!pathTimestamps.has(path)) {
-        pathTimestamps.set(path, []);
-    }
-    
-    const timestamps = pathTimestamps.get(path);
-    timestamps.push(now);
-    
-    const cutoff = now - windowMs;
-    while (timestamps.length > 0 && timestamps[0] < cutoff) {
-        timestamps.shift();
-    }
-    
-    const count = timestamps.length;
-    
-    if (count >= IP_PATH_ATTACK_THRESHOLD) {
-        if (!pathsUnderAttack.has(path)) {
-            pathsUnderAttack.set(path, {
-                active: true,
-                count: count,
-                ip: ip,
-                triggeredAt: now,
-                windowMs: windowMs
-            });
-            console.log(`ATTACK DETECTED on ${path} | IP: ${ip} | Count: ${count} requests in ${windowMs/1000}s window - CACHE PUNISHMENT ACTIVATED (${ATTACK_CONFIG.CACHE_PUNISHMENT_TTL}s)`);
-        } else {
-            pathsUnderAttack.get(path).triggeredAt = now;
-        }
-    }
+  }
 };
 
 const cleanMaps = () => {
-    const now = Date.now();
-    const cutoff = now - RATE_LIMIT_WINDOW_MS;
-    for (const [ip, until] of bannedIps) {
-        if (now > until) bannedIps.delete(ip);
+  const now = Date.now();
+  const cutoff = now - RATE_LIMIT_WINDOW_MS;
+  for (const [ip, until] of bannedIps) {
+    if (now > until) bannedIps.delete(ip);
+  }
+  for (const [ip, timestamps] of ipRequests) {
+    while (timestamps.length > 0 && timestamps[0] < cutoff) timestamps.shift();
+    if (timestamps.length === 0) {
+      ipRequests.delete(ip);
+      violationCounts.delete(ip);
     }
-    for (const [ip, timestamps] of ipRequests) {
-        while (timestamps.length > 0 && timestamps[0] < cutoff) timestamps.shift();
-        if (timestamps.length === 0) {
-            ipRequests.delete(ip);
-            violationCounts.delete(ip);
-        }
+  }
+  
+  const punishCutoff = now - CACHE_CONFIG.ATTACK_PUNISHMENT_TTL * 1000;
+  for (const [path, attack] of pathsUnderAttack) {
+    if (attack.triggeredAt < punishCutoff) {
+      pathsUnderAttack.delete(path);
     }
-    if (ipRequests.size > MAX_TRACKED_IPS) {
-        const excess = [...ipRequests.entries()]
-            .sort((a, b) => a[1][a[1].length - 1] - b[1][b[1].length - 1])
-            .slice(0, ipRequests.size - MAX_TRACKED_IPS);
-        for (const [ip] of excess) {
-            ipRequests.delete(ip);
-            violationCounts.delete(ip);
-        }
+  }
+  for (const [ip, pathTimestamps] of ipPathTimestamps) {
+    for (const [path, timestamps] of pathTimestamps) {
+      const cutoff2 = now - getTrackingWindowMs();
+      while (timestamps.length > 0 && timestamps[0] < cutoff2) {
+        timestamps.shift();
+      }
+      if (timestamps.length === 0) {
+        pathTimestamps.delete(path);
+      }
     }
-    
-    const punishCutoff = now - ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
-    for (const [path, attack] of pathsUnderAttack) {
-        if (attack.triggeredAt < punishCutoff) {
-            console.log(`ATTACK DE-ESCALATED on ${path} - cache punishment expired`);
-            pathsUnderAttack.delete(path);
-        }
+    if (pathTimestamps.size === 0) {
+      ipPathTimestamps.delete(ip);
     }
-    for (const [ip, pathTimestamps] of ipPathTimestamps) {
-        for (const [path, timestamps] of pathTimestamps) {
-            const cutoff2 = now - getTrackingWindowMs();
-            while (timestamps.length > 0 && timestamps[0] < cutoff2) {
-                timestamps.shift();
-            }
-            if (timestamps.length === 0) {
-                pathTimestamps.delete(path);
-            }
-        }
-        if (pathTimestamps.size === 0) {
-            ipPathTimestamps.delete(ip);
-        }
-    }
-    if (ipPathTimestamps.size > MAX_TRACKED_PATH_IPS) {
-        const excess = [...ipPathTimestamps.entries()]
-            .sort((a, b) => {
-                const aLast = Math.max(...Array.from(a[1].values(), t => t[t.length - 1] || 0));
-                const bLast = Math.max(...Array.from(b[1].values(), t => t[t.length - 1] || 0));
-                return aLast - bLast;
-            })
-            .slice(0, ipPathTimestamps.size - MAX_TRACKED_PATH_IPS);
-        for (const [ip] of excess) {
-            ipPathTimestamps.delete(ip);
-        }
-    }
-};
-
-const ensureCapacity = (ip) => {
-    if (ipRequests.has(ip)) return;
-    if (ipRequests.size >= MAX_TRACKED_IPS) {
-        let oldest = null;
-        let oldestTime = Infinity;
-        for (const [entryIp, timestamps] of ipRequests) {
-            const last = timestamps[timestamps.length - 1];
-            if (last < oldestTime) {
-                oldestTime = last;
-                oldest = entryIp;
-            }
-        }
-        if (oldest) {
-            ipRequests.delete(oldest);
-            violationCounts.delete(oldest);
-        }
-    }
+  }
 };
 
 function recordViolation(ip) {
   const count = (violationCounts.get(ip) || 0) + 1;
   violationCounts.set(ip, count);
   if (count >= BAN_THRESHOLD) {
-    console.log(`Auto-banning IP ${ip} for ${BAN_DURATION_MS}ms`);
     bannedIps.set(ip, Date.now() + BAN_DURATION_MS);
     violationCounts.delete(ip);
   }
@@ -247,13 +179,9 @@ function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus, e
     return 0;
   }
   
-  if (hasRangeHeader) {
-    return 3600;
-  }
-  
   if (responseContentType.includes('application/json')) {
     if (isPathUnderAttack(pathname)) {
-      return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL;
+      return CACHE_CONFIG.ATTACK_PUNISHMENT_TTL;
     }
     return 0;
   }
@@ -262,41 +190,44 @@ function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus, e
     return 0;
   }
   
+  const effectivePath = ext ? pathname + ext.toLowerCase() : pathname;
+  
+  if (effectivePath.match(/\.(ts|m4s)$/i)) {
+    return CACHE_CONFIG.SEGMENT_TTL;
+  }
+  
+  if (effectivePath.match(/\.(mp4|webm|avi|mov|mkv)$/i)) {
+    if (hasRangeHeader) {
+      return CACHE_CONFIG.PARTIAL_TTL;
+    }
+    return CACHE_CONFIG.FULL_TTL;
+  }
+  
+  if (effectivePath.match(/\.(mp3|wav|ogg|m4a|flac|aac)$/i)) {
+    if (hasRangeHeader) {
+      return CACHE_CONFIG.PARTIAL_TTL;
+    }
+    return CACHE_CONFIG.FULL_TTL;
+  }
+  
+  if (effectivePath.endsWith('.m3u8') || 
+      effectivePath.endsWith('.mpd') ||
+      responseContentType.includes('application/vnd.apple.mpegurl') ||
+      responseContentType.includes('application/x-mpegurl') ||
+      responseContentType.includes('application/dash+xml')) {
+    return CACHE_CONFIG.MANIFEST_TTL;
+  }
+  
+  if (effectivePath.match(/\.(jpg|jpeg|png|gif|webp|bmp|svg|ico)$/i)) {
+    return CACHE_CONFIG.FULL_TTL;
+  }
+  
   if (responseContentType.includes('text/html') || 
       responseContentType.includes('application/javascript') || 
       responseContentType.includes('text/css') || 
       responseContentType.includes('text/plain') || 
       responseContentType.includes('text/xml')) {
     return 3600;
-  }
-  
-  const effectivePath = ext ? pathname + ext.toLowerCase() : pathname;
-  
-  if (effectivePath.endsWith('.m3u8') || 
-      responseContentType.includes('application/vnd.apple.mpegurl') ||
-      responseContentType.includes('application/x-mpegurl')) {
-    return 43200;
-  }
-  
-  if (effectivePath.endsWith('.mpd') || 
-      responseContentType.includes('application/dash+xml')) {
-    return 43200;
-  }
-  
-  if (effectivePath.endsWith('.ts') || effectivePath.endsWith('.m4s')) {
-    return 43200;
-  }
-  
-  if (effectivePath.match(/\.(jpg|jpeg|png|gif|webp|bmp|svg|ico)$/i)) {
-    return 43200;
-  }
-  
-  if (effectivePath.match(/\.(mp3|wav|ogg|m4a|flac|aac)$/i)) {
-    return 43200;
-  }
-  
-  if (effectivePath.match(/\.(mp4|webm|avi|mov|mkv)$/i)) {
-    return 43200;
   }
   
   return 0;
@@ -399,10 +330,28 @@ async function proxyRequestToOrigin(request, clientIP, env, ctx) {
     resHeaders.set('CDN-Cache-Control', `public, max-age=${cacheTtl}`);
     resHeaders.set('X-Cache', fromCache ? 'HIT' : 'MISS');
     resHeaders.set('CF-Cache-Status', fromCache ? 'HIT' : 'MISS');
-    resHeaders.set('Vary', 'Accept-Encoding');
+    resHeaders.set('Vary', 'Accept-Encoding, Range');
   } else {
     resHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
     resHeaders.set('CDN-Cache-Control', 'no-cache, no-store, must-revalidate');
+  }
+
+  const isSegment = url.pathname.match(/\.(ts|m4s)$/i);
+  const isVideo = url.pathname.match(/\.(mp4|webm|avi|mov|mkv)$/i);
+  const isAudio = url.pathname.match(/\.(mp3|wav|ogg|m4a|flac|aac)$/i);
+  const isManifest = url.pathname.match(/\.(m3u8|mpd)$/i);
+  const isMedia = isSegment || isVideo || isAudio || isManifest;
+
+  if (isMedia && shouldCache) {
+    if (!fromCache) {
+      const cacheClone = cachedResponse.clone();
+      ctx.waitUntil(cache.put(cacheKey, cacheClone));
+    }
+    return new Response(cachedResponse.body, {
+      status: cachedResponse.status,
+      statusText: cachedResponse.statusText,
+      headers: resHeaders
+    });
   }
 
   const responseBody = await cachedResponse.arrayBuffer();
@@ -413,7 +362,6 @@ async function proxyRequestToOrigin(request, clientIP, env, ctx) {
       statusText: cachedResponse.statusText,
       headers: resHeaders
     });
-    
     ctx.waitUntil(cache.put(cacheKey, newResponse.clone()));
   }
 
@@ -431,9 +379,6 @@ setInterval(() => {
 export default {
   async fetch(request, env, ctx) {
     try {
-      requestCount++;
-      if (requestCount % 100 === 0) cleanMaps();
-
       const clientIP = getClientIp(request);
       
       const url = new URL(request.url);
@@ -464,7 +409,6 @@ export default {
       const now = Date.now();
 
       if (!ipRequests.has(clientIP)) {
-        ensureCapacity(clientIP);
         ipRequests.set(clientIP, []);
       }
       const timestamps = ipRequests.get(clientIP);
@@ -482,7 +426,6 @@ export default {
       timestamps.push(now);
 
       const result = await proxyRequestToOrigin(request, clientIP, env, ctx);
-
       return result;
     } catch (error) {
       return new Response('Internal Server Error', { 

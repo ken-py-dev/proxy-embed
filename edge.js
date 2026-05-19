@@ -1,173 +1,229 @@
-export const config = { runtime: 'edge' };
+export const config = {
+  runtime: 'edge'
+};
 
-const PROXY_URLS = (() => {
-  try {
-    return process.env.PROXY_URLS ? JSON.parse(process.env.PROXY_URLS) : 
-           process.env.PROXY_URL ? [process.env.PROXY_URL] : 
-           ['https://proxy-embed.nethriondev.workers.dev'];
-  } catch { return ['https://proxy-embed.nethriondev.workers.dev']; }
-})();
+const ORIGIN_URL = 'https://proxy-embed.nethriondev.workers.dev';
 
-const BLOCKED_IPS = (() => {
-  const ips = ['72.60.237.246'];
-  try {
-    if (process.env.BLOCKED_IPS) ips.push(...JSON.parse(process.env.BLOCKED_IPS));
-  } catch {}
-  return ips;
-})();
+const BLOCKED_IPS = [
+  '72.60.237.246'
+];
 
-const INTERNAL_PROXY_IPS = new Set((() => {
-  const ips = ['162.220.234.134'];
-  try {
-    if (process.env.INTERNAL_PROXY_IPS) ips.push(...JSON.parse(process.env.INTERNAL_PROXY_IPS));
-  } catch {}
-  return ips;
-})());
+const INTERNAL_PROXY_IPS = ["162.220.234.134"];
 
-const ATTACK_CONFIG = { CACHE_PUNISHMENT_TTL: 300 };
-const IP_PATH_ATTACK_THRESHOLD = 500;
-const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60000;
-const MAX_REQUESTS_PER_WINDOW = parseInt(process.env.MAX_REQUESTS_PER_WINDOW) || 200;
-const BAN_THRESHOLD = parseInt(process.env.BAN_THRESHOLD) || 3;
-const BAN_DURATION_MS = parseInt(process.env.BAN_DURATION_MS) || 900000;
+const RATE_LIMIT_WINDOW_MS = 60000;
+const MAX_REQUESTS_PER_WINDOW = 200;
+const BAN_THRESHOLD = 3;
+const BAN_DURATION_MS = 900000;
+
+const CACHE_CONFIG = {
+  SEGMENT_TTL: 86400,
+  PARTIAL_TTL: 3600,
+  FULL_TTL: 604800,
+  MANIFEST_TTL: 43200,
+  ATTACK_PUNISHMENT_TTL: 300
+};
 
 const ipRequests = new Map();
 const bannedIps = new Map();
 const violationCounts = new Map();
 const trustedIps = new Set();
+const internalProxyIps = new Set(INTERNAL_PROXY_IPS);
+
 const pathsUnderAttack = new Map();
 const ipPathTimestamps = new Map();
-const responseCache = new Map();
 
-const getTrackingWindowMs = () => ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000;
+const IP_PATH_ATTACK_THRESHOLD = 500;
 
-const isPathUnderAttack = (path) => pathsUnderAttack.has(path);
-
-const getCacheTtl = (url, contentType, hasRangeHeader, statusCode, ext) => {
-  const pathname = url.toLowerCase();
-  
-  if (contentType.includes('application/json') && isPathUnderAttack(pathname)) {
-    return ATTACK_CONFIG.CACHE_PUNISHMENT_TTL;
-  }
-  if (statusCode < 200 || statusCode >= 400) return 0;
-  if (hasRangeHeader) return 3600;
-  if (contentType.includes('text/html') || contentType.includes('application/javascript') || 
-      contentType.includes('text/css') || contentType.includes('text/plain') || 
-      contentType.includes('text/xml')) return 3600;
-  
-  const effectivePath = ext ? pathname + ext.toLowerCase() : pathname;
-  if (effectivePath.endsWith('.m3u8') || effectivePath.endsWith('.mpd') || 
-      effectivePath.endsWith('.ts') || effectivePath.endsWith('.m4s')) return 43200;
-  if (effectivePath.match(/\.(jpg|jpeg|png|gif|webp|bmp|svg|ico)$/i)) return 43200;
-  if (effectivePath.match(/\.(mp3|wav|ogg|m4a|flac|aac)$/i)) return 43200;
-  if (effectivePath.match(/\.(mp4|webm|avi|mov|mkv)$/i)) return 43200;
-  
-  return 0;
+const getTrackingWindowMs = () => {
+  return CACHE_CONFIG.ATTACK_PUNISHMENT_TTL * 1000;
 };
 
-const getClientIp = (request) => {
-  const forwarded = request.headers.get('forwarded');
-  if (forwarded) {
-    const match = forwarded.match(/for=([^;]+)/);
-    if (match) return match[1].replace(/^"|"$/g, '').replace(/^\[|\]$/g, '');
-  }
-  return request.headers.get('x-vercel-forwarded-for')?.split(',')[0]?.trim() ||
-         request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
-         request.headers.get('x-real-ip') ||
-         request.headers.get('cf-connecting-ip') ||
-         'unknown';
+const isPathUnderAttack = (path) => {
+  return pathsUnderAttack.has(path);
 };
 
 const recordPathRequest = (ip, path) => {
   const now = Date.now();
   const windowMs = getTrackingWindowMs();
   
-  if (!ipPathTimestamps.has(ip)) ipPathTimestamps.set(ip, new Map());
+  if (!ipPathTimestamps.has(ip)) {
+    ipPathTimestamps.set(ip, new Map());
+  }
+  
   const pathTimestamps = ipPathTimestamps.get(ip);
-  if (!pathTimestamps.has(path)) pathTimestamps.set(path, []);
+  
+  if (!pathTimestamps.has(path)) {
+    pathTimestamps.set(path, []);
+  }
   
   const timestamps = pathTimestamps.get(path);
   timestamps.push(now);
   
   const cutoff = now - windowMs;
-  while (timestamps.length > 0 && timestamps[0] < cutoff) timestamps.shift();
+  while (timestamps.length > 0 && timestamps[0] < cutoff) {
+    timestamps.shift();
+  }
   
-  if (timestamps.length >= IP_PATH_ATTACK_THRESHOLD && !pathsUnderAttack.has(path)) {
-    pathsUnderAttack.set(path, { triggeredAt: now });
-    console.log(`ATTACK DETECTED on ${path}`);
+  const count = timestamps.length;
+  
+  if (count >= IP_PATH_ATTACK_THRESHOLD) {
+    if (!pathsUnderAttack.has(path)) {
+      pathsUnderAttack.set(path, {
+        active: true,
+        count: count,
+        ip: ip,
+        triggeredAt: now,
+        windowMs: windowMs
+      });
+    } else {
+      pathsUnderAttack.get(path).triggeredAt = now;
+    }
   }
 };
 
-const cleanMaps = () => {
+function cleanMaps() {
   const now = Date.now();
-  for (const [ip, until] of bannedIps) if (now > until) bannedIps.delete(ip);
+  const cutoff = now - RATE_LIMIT_WINDOW_MS;
+  for (const [ip, until] of bannedIps) {
+    if (now > until) bannedIps.delete(ip);
+  }
   for (const [ip, timestamps] of ipRequests) {
-    while (timestamps.length > 0 && timestamps[0] < now - RATE_LIMIT_WINDOW_MS) timestamps.shift();
-    if (timestamps.length === 0) ipRequests.delete(ip);
+    while (timestamps.length > 0 && timestamps[0] < cutoff) timestamps.shift();
+    if (timestamps.length === 0) {
+      ipRequests.delete(ip);
+      violationCounts.delete(ip);
+    }
   }
+  
+  const punishCutoff = now - CACHE_CONFIG.ATTACK_PUNISHMENT_TTL * 1000;
   for (const [path, attack] of pathsUnderAttack) {
-    if (attack.triggeredAt < now - ATTACK_CONFIG.CACHE_PUNISHMENT_TTL * 1000) pathsUnderAttack.delete(path);
+    if (attack.triggeredAt < punishCutoff) {
+      pathsUnderAttack.delete(path);
+    }
   }
-  const cacheCutoff = now - 43200000;
-  for (const [key, cached] of responseCache) {
-    if (cached.expiry < now) responseCache.delete(key);
-  }
-};
-
-setInterval(cleanMaps, 15000);
-
-const isStreamingRequest = (request) => {
-  const accept = request.headers.get('accept') || '';
-  return accept.includes('text/event-stream') || 
-         accept.includes('application/stream+json') ||
-         request.headers.get('x-stream') === 'true';
-};
-
-export default async function handler(request) {
-  try {
-    cleanMaps();
-    const clientIP = getClientIp(request);
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-    
-    recordPathRequest(clientIP, pathname);
-    
-    if (trustedIps.has(clientIP) || INTERNAL_PROXY_IPS.has(clientIP)) {
-      return await proxyRequest(request, clientIP, url);
-    }
-    
-    if (bannedIps.has(clientIP)) {
-      return new Response('Too Many Requests', { status: 429 });
-    }
-    
-    if (BLOCKED_IPS.includes(clientIP)) {
-      return new Response('Forbidden', { status: 403 });
-    }
-    
-    const now = Date.now();
-    if (!ipRequests.has(clientIP)) ipRequests.set(clientIP, []);
-    const timestamps = ipRequests.get(clientIP);
-    const windowStart = now - RATE_LIMIT_WINDOW_MS;
-    while (timestamps.length > 0 && timestamps[0] < windowStart) timestamps.shift();
-    
-    if (timestamps.length >= MAX_REQUESTS_PER_WINDOW) {
-      const count = (violationCounts.get(clientIP) || 0) + 1;
-      violationCounts.set(clientIP, count);
-      if (count >= BAN_THRESHOLD) {
-        bannedIps.set(clientIP, now + BAN_DURATION_MS);
-        violationCounts.delete(clientIP);
+  for (const [ip, pathTimestamps] of ipPathTimestamps) {
+    for (const [path, timestamps] of pathTimestamps) {
+      const cutoff2 = now - getTrackingWindowMs();
+      while (timestamps.length > 0 && timestamps[0] < cutoff2) {
+        timestamps.shift();
       }
-      return new Response('Too Many Requests', { status: 429 });
+      if (timestamps.length === 0) {
+        pathTimestamps.delete(path);
+      }
     }
-    timestamps.push(now);
-    
-    return await proxyRequest(request, clientIP, url);
-  } catch (error) {
-    return new Response('Internal Server Error', { status: 500 });
+    if (pathTimestamps.size === 0) {
+      ipPathTimestamps.delete(ip);
+    }
   }
 }
 
-async function proxyRequest(request, clientIP, url) {
+function recordViolation(ip) {
+  const count = (violationCounts.get(ip) || 0) + 1;
+  violationCounts.set(ip, count);
+  if (count >= BAN_THRESHOLD) {
+    bannedIps.set(ip, Date.now() + BAN_DURATION_MS);
+    violationCounts.delete(ip);
+  }
+}
+
+const getClientIp = (request) => {
+  const clientIpHeader = request.headers.get('x-client-ip');
+  if (clientIpHeader) return clientIpHeader;
+
+  const forwardedHeader = request.headers.get('forwarded');
+  if (forwardedHeader) {
+    const forMatch = forwardedHeader.match(/for=([^;]+)/);
+    if (forMatch && forMatch[1]) {
+      let ip = forMatch[1].replace(/^"|"$/g, '');
+      ip = ip.replace(/^\[|\]$/g, '');
+      if (ip && ip !== 'unknown') return ip;
+    }
+  }
+
+  const xForwardedFor = request.headers.get('x-forwarded-for');
+  if (xForwardedFor) {
+    const ips = xForwardedFor.split(',');
+    const firstIp = ips[0]?.trim();
+    if (firstIp) return firstIp;
+  }
+
+  const xRealIp = request.headers.get('x-real-ip');
+  if (xRealIp) return xRealIp;
+
+  const cfConnectingIp = request.headers.get('cf-connecting-ip');
+  if (cfConnectingIp) return cfConnectingIp;
+
+  return 'unknown';
+};
+
+function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus) {
+  const pathname = url.pathname.toLowerCase();
+  
+  if (responseStatus < 200 || responseStatus >= 400) {
+    return 0;
+  }
+  
+  if (responseContentType.includes('application/json')) {
+    if (isPathUnderAttack(pathname)) {
+      return CACHE_CONFIG.ATTACK_PUNISHMENT_TTL;
+    }
+    return 0;
+  }
+  
+  if (responseContentType.includes('text/event-stream')) {
+    return 0;
+  }
+  
+  if (pathname.match(/\.(ts|m4s)$/i)) {
+    return CACHE_CONFIG.SEGMENT_TTL;
+  }
+  
+  if (pathname.match(/\.(mp4|webm|avi|mov|mkv)$/i)) {
+    if (hasRangeHeader) {
+      return CACHE_CONFIG.PARTIAL_TTL;
+    }
+    return CACHE_CONFIG.FULL_TTL;
+  }
+  
+  if (pathname.match(/\.(mp3|wav|ogg|m4a|flac|aac)$/i)) {
+    if (hasRangeHeader) {
+      return CACHE_CONFIG.PARTIAL_TTL;
+    }
+    return CACHE_CONFIG.FULL_TTL;
+  }
+  
+  if (pathname.endsWith('.m3u8') || 
+      pathname.endsWith('.mpd') ||
+      responseContentType.includes('application/vnd.apple.mpegurl') ||
+      responseContentType.includes('application/x-mpegurl') ||
+      responseContentType.includes('application/dash+xml')) {
+    return CACHE_CONFIG.MANIFEST_TTL;
+  }
+  
+  if (pathname.match(/\.(jpg|jpeg|png|gif|webp|bmp|svg|ico)$/i)) {
+    return CACHE_CONFIG.FULL_TTL;
+  }
+  
+  if (responseContentType.includes('text/html') || 
+      responseContentType.includes('application/javascript') || 
+      responseContentType.includes('text/css') || 
+      responseContentType.includes('text/plain') || 
+      responseContentType.includes('text/xml')) {
+    return 3600;
+  }
+  
+  return 0;
+}
+
+async function proxyRequestToOrigin(request, clientIP) {
+  if (request.headers.get('upgrade')?.toLowerCase() === 'websocket') {
+    const url = new URL(request.url);
+    url.hostname = new URL(ORIGIN_URL).hostname;
+    url.protocol = 'https:';
+    url.port = '443';
+    return fetch(url.toString(), request);
+  }
+
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -179,98 +235,153 @@ async function proxyRequest(request, clientIP, url) {
       }
     });
   }
+
+  const url = new URL(request.url);
+  const rangeHeader = request.headers.get('range');
   
-  const cacheKey = `${request.method}:${url.pathname}${url.search}`;
-  const cachedResponse = responseCache.get(cacheKey);
-  const noCache = request.headers.get('cache-control')?.includes('no-cache') || 
-                  request.headers.get('pragma') === 'no-cache';
-  
-  if (cachedResponse && !noCache && !isStreamingRequest(request)) {
-    const isExpired = Date.now() > cachedResponse.expiry;
-    if (!isExpired) {
-      const headers = new Headers(cachedResponse.headers);
-      headers.set('X-Cache', 'HIT');
-      headers.set('CF-Cache-Status', 'HIT');
-      return new Response(cachedResponse.body, {
-        status: cachedResponse.statusCode,
-        headers: headers
-      });
-    }
-    responseCache.delete(cacheKey);
+  const newHeaders = new Headers(request.headers);
+  newHeaders.set('x-forwarded-for', clientIP);
+  newHeaders.set('x-real-ip', clientIP);
+  newHeaders.set('cf-connecting-ip', clientIP);
+
+  const fetchUrl = new URL(url.toString());
+  fetchUrl.hostname = new URL(ORIGIN_URL).hostname;
+  fetchUrl.protocol = 'https:';
+  fetchUrl.port = '443';
+
+  const fetchOptions = {
+    method: request.method,
+    headers: newHeaders,
+  };
+
+  if (rangeHeader) {
+    fetchOptions.headers.set('Range', rangeHeader);
   }
+
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    fetchOptions.body = request.body;
+  }
+
+  let originResponse;
+  try {
+    originResponse = await fetch(fetchUrl.toString(), fetchOptions);
+  } catch (error) {
+    return new Response('Origin server error', {
+      status: 502,
+      headers: { 'Content-Type': 'text/plain' }
+    });
+  }
+
+  const contentType = originResponse.headers.get('content-type') || '';
+  const resHeaders = new Headers(originResponse.headers);
+
+  if (originResponse.status === 206) {
+    const contentRange = originResponse.headers.get('content-range');
+    if (contentRange) {
+      resHeaders.set('content-range', contentRange);
+    }
+    resHeaders.set('accept-ranges', 'bytes');
+  }
+
+  resHeaders.delete('x-railway-edge');
+  resHeaders.delete('x-railway-request-id');
+
+  resHeaders.set('Access-Control-Allow-Origin', '*');
+  resHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  resHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Accept, X-Stream, Range');
+  resHeaders.set('Access-Control-Expose-Headers', '*');
+
+  const cacheTtl = getCacheTtl(url, contentType, !!rangeHeader, originResponse.status);
+  const shouldCache = cacheTtl > 0 && (originResponse.status === 200 || originResponse.status === 206);
+  const isMedia = url.pathname.match(/\.(ts|m4s|mp4|webm|avi|mov|mkv|mp3|wav|ogg|m4a|flac|aac|m3u8|mpd)$/i);
+
+  if (shouldCache) {
+    if (isPathUnderAttack(url.pathname) && contentType.includes('application/json')) {
+      resHeaders.set('Cache-Control', `public, max-age=${CACHE_CONFIG.ATTACK_PUNISHMENT_TTL}, stale-while-revalidate=0`);
+    } else {
+      resHeaders.set('Cache-Control', `public, max-age=${cacheTtl}, stale-while-revalidate=${Math.floor(cacheTtl/2)}`);
+    }
+    resHeaders.set('CDN-Cache-Control', `public, max-age=${cacheTtl}`);
+    resHeaders.set('Vary', 'Accept-Encoding, Range');
+  } else {
+    resHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  }
+
+  if (isMedia) {
+    return new Response(originResponse.body, {
+      status: originResponse.status,
+      statusText: originResponse.statusText,
+      headers: resHeaders
+    });
+  }
+
+  const responseBody = await originResponse.arrayBuffer();
   
-  let currentProxyIndex = 0;
-  let lastError = null;
-  
-  for (let i = 0; i < PROXY_URLS.length; i++) {
-    const proxyUrl = PROXY_URLS[currentProxyIndex];
-    currentProxyIndex = (currentProxyIndex + 1) % PROXY_URLS.length;
+  return new Response(responseBody, {
+    status: originResponse.status,
+    statusText: originResponse.statusText,
+    headers: resHeaders
+  });
+}
+
+setInterval(() => {
+  cleanMaps();
+}, 15000);
+
+export default async function middleware(request) {
+  try {
+    const clientIP = getClientIp(request);
     
-    try {
-      const proxyHost = new URL(proxyUrl);
-      const fetchUrl = new URL(url.toString());
-      fetchUrl.hostname = proxyHost.hostname;
-      fetchUrl.protocol = proxyHost.protocol;
-      fetchUrl.port = proxyHost.port;
-      
-      const headers = new Headers(request.headers);
-      headers.set('X-Client-IP', clientIP);
-      headers.set('X-Forwarded-For', clientIP);
-      headers.set('X-Real-IP', clientIP);
-      
-      const response = await fetch(fetchUrl.toString(), {
-        method: request.method,
-        headers: headers,
-        body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined
-      });
-      
-      const contentType = response.headers.get('content-type') || '';
-      const ext = url.searchParams.get('ext') || undefined;
-      const hasRangeHeader = !!request.headers.get('range');
-      const cacheTtl = getCacheTtl(url.pathname, contentType, hasRangeHeader, response.status, ext);
-      const shouldCache = cacheTtl > 0 && response.status === 200 && !isStreamingRequest(request);
-      
-      const responseHeaders = new Headers(response.headers);
-      responseHeaders.delete('x-railway-edge');
-      responseHeaders.delete('x-railway-request-id');
-      responseHeaders.set('Access-Control-Allow-Origin', '*');
-      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-      responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Accept, X-Stream, Range');
-      responseHeaders.set('Access-Control-Expose-Headers', '*');
-      
-      if (shouldCache) {
-        const cacheControl = `public, max-age=${cacheTtl}, stale-while-revalidate=${Math.floor(cacheTtl/2)}`;
-        responseHeaders.set('Cache-Control', cacheControl);
-        responseHeaders.set('CDN-Cache-Control', `public, max-age=${cacheTtl}`);
-        responseHeaders.set('X-Cache', 'MISS');
-        responseHeaders.set('CF-Cache-Status', 'MISS');
-        responseHeaders.set('Vary', 'Accept-Encoding');
-      } else {
-        responseHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-        responseHeaders.set('CDN-Cache-Control', 'no-cache, no-store, must-revalidate');
-      }
-      
-      const body = await response.arrayBuffer();
-      
-      if (shouldCache && !noCache) {
-        responseCache.set(cacheKey, {
-          body: body,
-          headers: Object.fromEntries(responseHeaders),
-          statusCode: response.status,
-          expiry: Date.now() + (cacheTtl * 1000)
+    const url = new URL(request.url);
+    recordPathRequest(clientIP, url.pathname);
+    
+    if (trustedIps.has(clientIP) || internalProxyIps.has(clientIP)) {
+      return await proxyRequestToOrigin(request, clientIP);
+    }
+
+    if (bannedIps.has(clientIP)) {
+      const until = bannedIps.get(clientIP);
+      if (Date.now() < until) {
+        return new Response('Too Many Requests', {
+          status: 429,
+          headers: { 'Content-Type': 'text/plain', 'Retry-After': '300' }
         });
       }
-      
-      return new Response(body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders
-      });
-    } catch (error) {
-      lastError = error;
-      continue;
+      bannedIps.delete(clientIP);
     }
+
+    if (BLOCKED_IPS.includes(clientIP)) {
+      return new Response('Forbidden', { 
+        status: 403,
+        headers: { 'Content-Type': 'text/plain' }
+      });
+    }
+
+    const now = Date.now();
+
+    if (!ipRequests.has(clientIP)) {
+      ipRequests.set(clientIP, []);
+    }
+    const timestamps = ipRequests.get(clientIP);
+    const windowStart = now - RATE_LIMIT_WINDOW_MS;
+    while (timestamps.length > 0 && timestamps[0] < windowStart) {
+      timestamps.shift();
+    }
+    if (timestamps.length >= MAX_REQUESTS_PER_WINDOW) {
+      recordViolation(clientIP);
+      return new Response('Too Many Requests', {
+        status: 429,
+        headers: { 'Content-Type': 'text/plain', 'Retry-After': '300' }
+      });
+    }
+    timestamps.push(now);
+
+    const result = await proxyRequestToOrigin(request, clientIP);
+    return result;
+  } catch (error) {
+    return new Response('Internal Server Error', { 
+      status: 500,
+      headers: { 'Content-Type': 'text/plain' }
+    });
   }
-  
-  return new Response(lastError?.message || 'All proxies failed', { status: 502 });
 }
