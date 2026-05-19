@@ -20,8 +20,7 @@ const CACHE_CONFIG = {
   PARTIAL_TTL: 86400,
   FULL_TTL: 604800,
   MANIFEST_TTL: 43200,
-  ATTACK_PUNISHMENT_TTL: 300,
-  CHUNK_SIZE: 10 * 1024 * 1024
+  ATTACK_PUNISHMENT_TTL: 300
 };
 
 const ipRequests = new Map();
@@ -157,133 +156,6 @@ const getClientIp = (request) => {
   return 'unknown';
 };
 
-const parseRangeHeader = (rangeHeader, fileSize) => {
-  const matches = rangeHeader.match(/bytes=(\d+)-(\d*)/);
-  if (!matches) return null;
-  
-  let start = parseInt(matches[1], 10);
-  let end = matches[2] ? parseInt(matches[2], 10) : fileSize - 1;
-  
-  start = Math.min(Math.max(0, start), fileSize - 1);
-  end = Math.min(end, fileSize - 1);
-  
-  return { start, end };
-};
-
-async function getVideoChunk(url, start, end, clientIP) {
-  const chunkKey = new Request(`${url.toString()}?chunk=${start}-${end}`, {
-    headers: { 'Range': `bytes=${start}-${end}` }
-  });
-  
-  const cache = caches.default;
-  let cached = await cache.match(chunkKey);
-  
-  if (!cached) {
-    const fetchUrl = new URL(url.pathname + url.search, ORIGIN_URL);
-    const headers = new Headers();
-    headers.set('Range', `bytes=${start}-${end}`);
-    headers.set('x-forwarded-for', clientIP);
-    headers.set('x-real-ip', clientIP);
-    headers.set('cf-connecting-ip', clientIP);
-    
-    try {
-      cached = await fetch(fetchUrl.toString(), {
-        method: 'GET',
-        headers: headers,
-        cf: { cacheEverything: true }
-      });
-      
-      if (cached.status === 206 || cached.status === 200) {
-        const responseToCache = cached.clone();
-        await cache.put(chunkKey, responseToCache);
-      }
-    } catch (error) {
-      return new Response('Chunk fetch error', { status: 502 });
-    }
-  }
-  
-  return cached;
-}
-
-async function handleLargeMediaWithChunks(request, url, clientIP) {
-  const cache = caches.default;
-  const rangeHeader = request.headers.get('range');
-  const CHUNK_SIZE = CACHE_CONFIG.CHUNK_SIZE;
-  
-  const headKey = new Request(`${url.toString()}?head=true`, { method: 'HEAD' });
-  let headResponse = await cache.match(headKey);
-  
-  if (!headResponse) {
-    const fetchUrl = new URL(url.pathname, ORIGIN_URL);
-    const headFetch = await fetch(fetchUrl.toString(), {
-      method: 'HEAD',
-      headers: { 'x-forwarded-for': clientIP }
-    });
-    headResponse = new Response(null, {
-      headers: headFetch.headers
-    });
-    await cache.put(headKey, headResponse.clone());
-  }
-  
-  const contentLength = parseInt(headResponse.headers.get('content-length') || '0');
-  if (!contentLength) {
-    return null;
-  }
-  
-  if (!rangeHeader) {
-    const chunkStart = 0;
-    const chunkEnd = Math.min(CHUNK_SIZE - 1, contentLength - 1);
-    const firstChunk = await getVideoChunk(url, chunkStart, chunkEnd, clientIP);
-    
-    const headers = new Headers(firstChunk.headers);
-    headers.set('Accept-Ranges', 'bytes');
-    headers.set('Access-Control-Allow-Origin', '*');
-    headers.set('Cache-Control', `public, max-age=${CACHE_CONFIG.FULL_TTL}`);
-    headers.set('Content-Length', contentLength.toString());
-    
-    return new Response(firstChunk.body, {
-      status: 200,
-      statusText: 'OK',
-      headers: headers
-    });
-  }
-  
-  const parsedRange = parseRangeHeader(rangeHeader, contentLength);
-  if (!parsedRange) {
-    return new Response('Invalid Range', { status: 416 });
-  }
-  
-  let { start, end } = parsedRange;
-  const requestedLength = end - start + 1;
-  
-  const chunkStart = Math.floor(start / CHUNK_SIZE) * CHUNK_SIZE;
-  const chunkEnd = Math.min(chunkStart + CHUNK_SIZE - 1, contentLength - 1);
-  const chunk = await getVideoChunk(url, chunkStart, chunkEnd, clientIP);
-  
-  if (!chunk || chunk.status !== 206) {
-    return chunk;
-  }
-  
-  const chunkData = await chunk.arrayBuffer();
-  const offsetInChunk = start - chunkStart;
-  const sliceEnd = Math.min(offsetInChunk + requestedLength, chunkData.byteLength);
-  const slicedData = chunkData.slice(offsetInChunk, sliceEnd);
-  
-  const headers = new Headers();
-  headers.set('Content-Type', chunk.headers.get('content-type') || 'video/mp4');
-  headers.set('Content-Range', `bytes ${start}-${end}/${contentLength}`);
-  headers.set('Content-Length', slicedData.byteLength.toString());
-  headers.set('Accept-Ranges', 'bytes');
-  headers.set('Access-Control-Allow-Origin', '*');
-  headers.set('Cache-Control', `public, max-age=${CACHE_CONFIG.PARTIAL_TTL}`);
-  
-  return new Response(slicedData, {
-    status: 206,
-    statusText: 'Partial Content',
-    headers: headers
-  });
-}
-
 function getCacheTtl(url, responseContentType, hasRangeHeader, responseStatus, contentLength) {
   const pathname = url.pathname.toLowerCase();
   
@@ -373,15 +245,6 @@ async function proxyRequestToOrigin(request, clientIP) {
   const url = new URL(request.url);
   const pathname = url.pathname.toLowerCase();
   
-  const isLargeMediaFile = pathname.match(/\.(mp4|webm|avi|mov|mkv|mp3|wav|ogg|m4a|flac|aac)$/i);
-  
-  if (isLargeMediaFile) {
-    const chunkedResponse = await handleLargeMediaWithChunks(request, url, clientIP);
-    if (chunkedResponse) {
-      return chunkedResponse;
-    }
-  }
-  
   const rangeHeader = request.headers.get('range');
   
   const newHeaders = new Headers(request.headers);
@@ -440,7 +303,7 @@ async function proxyRequestToOrigin(request, clientIP) {
   resHeaders.set('Access-Control-Expose-Headers', '*');
 
   const cacheTtl = getCacheTtl(url, contentType, !!rangeHeader, originResponse.status, contentLength);
-  const shouldCache = cacheTtl > 0 && (originResponse.status === 200 || originResponse.status === 206) && !isLargeMediaFile;
+  const shouldCache = cacheTtl > 0 && (originResponse.status === 200 || originResponse.status === 206);
   const isMedia = pathname.match(/\.(ts|m4s|mp4|webm|avi|mov|mkv|mp3|wav|ogg|m4a|flac|aac|m3u8|mpd)$/i);
 
   if (shouldCache) {
@@ -455,7 +318,7 @@ async function proxyRequestToOrigin(request, clientIP) {
     resHeaders.set('Cache-Control', 'no-cache, no-store, must-revalidate');
   }
 
-  if (isMedia && !isLargeMediaFile) {
+  if (isMedia) {
     return new Response(originResponse.body, {
       status: originResponse.status,
       statusText: originResponse.statusText,
