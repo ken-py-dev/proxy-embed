@@ -1,12 +1,12 @@
 # Proxy Embed
 
-> A dual-deployment reverse proxy — runs as an **Express server** (Node.js / Vercel / Railway) or a **Cloudflare Worker** at the edge. Forwards HTTP/WebSocket requests to configurable backend URLs with rate limiting, IP filtering, proxy rotation/failover, smart caching, and media streaming support.
+> A multi-runtime reverse proxy — runs on **Vercel Edge Functions** (modern), **Cloudflare Workers**, or as a **legacy Express server** (Node.js / Railway). Forwards HTTP/WebSocket requests to configurable backend URLs with rate limiting, IP filtering, proxy rotation/failover, smart caching, and media streaming support.
 
 ## Why Proxy Embed?
 
 | Benefit | What it means for you |
 |---------|----------------------|
-| **Dual deployment** | Run the same proxy on Node.js (Railway/Vercel) **or** Cloudflare Workers — no code changes needed |
+| **Multi-runtime** | Run the same proxy on **Vercel Edge Functions**, **Cloudflare Workers**, or **Node.js** — no code changes needed, pick the runtime that fits your stack |
 | **Abuse protection** | Rate limiting + IP blocklisting + auto-ban stops malicious traffic before it reaches your backend |
 | **High availability** | Automatic failover across multiple backend URLs — if one goes down, traffic routes to the next |
 | **Global edge caching** | Content-type-aware caching with TTLs up to 12h — reduces backend load and speeds up delivery |
@@ -22,11 +22,12 @@
 
 ```
 index.js      — Process manager (spawns proxy.js with auto-restart)
-proxy.js      — Express reverse proxy (Node.js / Vercel / Railway)
+proxy.js      — Express reverse proxy (Node.js / Railway) — **legacy**, use edge.js instead
+edge.js       — Vercel Edge Functions runtime (modern replacement for proxy.js)
 workers.js    — Cloudflare Workers edge deployment (standalone)
 ```
 
-Two independent implementations (`proxy.js` and `workers.js`) that share the same core logic.
+Three runtime implementations. **`edge.js` is the modern, recommended runtime** — `proxy.js` is kept for backward compatibility on Node.js / Railway.
 
 ## How It Works
 
@@ -34,7 +35,9 @@ Two independent implementations (`proxy.js` and `workers.js`) that share the sam
 
 Spawns `proxy.js` as a child process. If the `PID` environment variable is set to anything other than `"0"`, the process auto-restarts on crash — ideal for production deployments on Railway or similar platforms.
 
-### 2. Express Proxy (`proxy.js`)
+### 2. Express Proxy (`proxy.js`) — Legacy
+
+> ⚠️ **Legacy.** Use `edge.js` for new deployments. The Express proxy is kept for backward compatibility on Node.js / Railway.
 
 An Express server that acts as a middleman between clients and backend services:
 
@@ -52,6 +55,26 @@ An Express server that acts as a middleman between clients and backend services:
 - **Attack detection** — Per-IP-per-path request tracking with adaptive time windows. When an IP exceeds the attack threshold on a specific path, the path enters **cache absorption mode** — JSON responses get a short cache TTL to protect the backend
 - **Auto-de-escalation** — Cache punishment automatically expires after `CACHE_PUNISHMENT_TTL` seconds without further attacks
 - **OOM protection** — Memory-safe tracking with caps on tracked IPs (`MAX_TRACKED_IPS`, `MAX_TRACKED_PATH_IPS`) and oldest-entry eviction
+
+### 2b. Edge Runtime (`edge.js`) — Modern
+
+> 🚀 **Recommended runtime.** Deploys to Vercel Edge Functions — lower latency, global distribution, no servers to manage.
+
+A lightweight edge-native proxy using the Web `fetch` / `Request` / `Response` APIs:
+
+- **Proxy targets** — Reads from `PROXY_URL` or `PROXY_URLS` environment variables
+- **Client IP detection** — Detects the real client IP via `forwarded`, `x-vercel-forwarded-for`, `x-forwarded-for`, `x-real-ip`, and `cf-connecting-ip` headers
+- **Rate limiting** — Per-IP request tracking with configurable time window and max requests
+- **IP blocking** — Static blocklist plus auto-ban after repeated violations
+- **Multi-origin failover** — Tries each proxy URL in sequence; if one fails, falls through to the next
+- **Header forwarding** — Passes through all client headers, plus adds `X-Client-IP`, `X-Forwarded-For`, `X-Real-IP`
+- **CORS** — Wildcard CORS headers on all responses (including preflight `OPTIONS`)
+- **Smart caching** — Content-type-aware `Cache-Control` and `CDN-Cache-Control` TTLs with in-memory response cache
+- **Attack detection** — Per-IP-per-path request tracking with cache absorption for JSON responses under attack
+- **Auto-de-escalation** — Cache punishment automatically expires after `CACHE_PUNISHMENT_TTL` seconds
+- **Memory-safe** — Stale entry cleanup every 15 seconds via interval
+
+> **Key difference from `proxy.js`:** `edge.js` runs on Vercel's Edge Runtime (no Express, no Node.js APIs), uses the native `fetch` API, and is globally distributed by default. WebSocket passthrough is not supported on Vercel Edge Functions.
 
 ### 3. Cloudflare Worker (`workers.js`)
 
@@ -157,14 +180,14 @@ In addition to per-IP rate limiting, the proxy includes a **per-IP-per-path atta
 
 ### Behavior by Platform
 
-| Action | Express (proxy.js) | Workers (workers.js) |
-|--------|-------------------|---------------------|
-| Rate limited | Socket destroyed | `429 Too Many Requests` |
-| Banned | HTTP redirect to `http://{ip}` | `429 Too Many Requests` |
-| Blocklisted | HTTP redirect to `http://{ip}` | `403 Forbidden` |
-| Attack detected | Cache absorption (300s TTL on JSON) | Cache absorption (300s TTL on JSON) |
+| Action | Express (proxy.js) — Legacy | Edge (edge.js) — Modern | Workers (workers.js) |
+|--------|-----------------------------|------------------------|---------------------|
+| Rate limited | Socket destroyed | `429 Too Many Requests` | `429 Too Many Requests` |
+| Banned | HTTP redirect to `http://{ip}` | `429 Too Many Requests` | `429 Too Many Requests` |
+| Blocklisted | HTTP redirect to `http://{ip}` | `403 Forbidden` | `403 Forbidden` |
+| Attack detected | Cache absorption (300s TTL on JSON) | Cache absorption (300s TTL on JSON) | Cache absorption (300s TTL on JSON) |
 
-> **Note:** The Express version redirects banned IPs to their own IP address as a probing mechanism (to detect when the IP comes back online). The Worker version returns proper HTTP status codes.
+> **Note:** The Express version redirects banned IPs to their own IP address as a probing mechanism (to detect when the IP comes back online). The Edge and Worker versions return proper HTTP status codes.
 
 ## Proxy Rotation & Failover
 
@@ -200,7 +223,7 @@ Both deployments apply content-type-aware `Cache-Control` headers:
 | Images | 12 hours | `.jpg`, `.png`, `.gif`, `.webp`, `.svg` |
 | Video | 12 hours | `.mp4`, `.webm`, `.avi`, `.mov` |
 | Audio | 12 hours | `.mp3`, `.wav`, `.ogg`, `.m4a` |
-| HTML | 1 hour | — |
+| HTML / JS / CSS | 1 hour | — |
 | API / JSON / SSE | No cache | `/api/*` paths, `.json` |
 | Error responses (non-200/206) | No cache | — |
 | Attack-detected paths (JSON only) | 5 minutes | Cache absorber active |
@@ -210,16 +233,18 @@ Both deployments apply content-type-aware `Cache-Control` headers:
 
 | Platform | Entry Point | Config Source |
 |----------|-------------|---------------|
-| Node.js / Railway | `index.js` | `proxy-config.json` or env vars |
-| Vercel | `proxy.js` (serverless) | `vercel.json` + env vars |
+| Node.js / Railway | `index.js` (spawns `proxy.js`) | `proxy-config.json` or env vars |
+| Vercel Edge (modern) | `edge.js` | Vercel env vars |
+| Vercel Serverless (legacy) | `proxy.js` | `vercel.json` + env vars |
 | Cloudflare Workers | `workers.js` | `wrangler.toml` / edit `ORIGIN_URLS` |
 
 ## WebSocket Support
 
-WebSocket upgrades (`Upgrade: websocket`) are supported in both deployments:
+WebSocket upgrades (`Upgrade: websocket`) are supported in the following deployments:
 
-- **Express** — Full WebSocket proxy with rate limiting and IP filtering. Connects to the configured proxy URLs using `wss://` protocol
-- **Workers** — WebSocket requests are forwarded directly to origin servers with failover
+- **Express (`proxy.js`)** — Full WebSocket proxy with rate limiting and IP filtering. Connects to the configured proxy URLs using `wss://` protocol
+- **Workers (`workers.js`)** — WebSocket requests are forwarded directly to origin servers with failover
+- **Edge (`edge.js`)** — WebSocket passthrough is **not supported** on Vercel Edge Functions
 
 ## License
 
