@@ -217,7 +217,6 @@ async function proxyRequest(request, clientIP, url) {
       headers.set('X-Client-IP', clientIP);
       headers.set('X-Forwarded-For', clientIP);
       headers.set('X-Real-IP', clientIP);
-      headers.set('x-is-internal', 'true');
       
       const response = await fetch(fetchUrl.toString(), {
         method: request.method,

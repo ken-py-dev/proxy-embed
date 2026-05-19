@@ -341,7 +341,6 @@ async function proxyRequestToOrigin(request, clientIP, env, ctx) {
     newHeaders.set('x-forwarded-for', clientIP);
     newHeaders.set('x-real-ip', clientIP);
     newHeaders.set('cf-connecting-ip', clientIP);
-    newHeaders.set('x-is-internal', 'true');
 
     const fetchUrl = new URL(url.toString());
     fetchUrl.hostname = new URL(ORIGIN_URL).hostname;
