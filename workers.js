@@ -399,12 +399,37 @@ export default {
         bannedIps.delete(clientIP);
       }
 
-      if (BLOCKED_IPS.includes(clientIP)) {
-        return new Response('Forbidden', { 
-          status: 403,
-          headers: { 'Content-Type': 'text/plain' }
-        });
-      }
+          if (BLOCKED_IPS.includes(clientIP)) {
+    const asciiTroll = `
++--------------------------------------------------+
+|               ACCESS DENIED                      |
++--------------------------------------------------+
+|      IP ni tangang skid: ${clientIP}             |
+|     (\\_/)                                       |
+|     (o.o)    Nice try, script kiddie             |
+|     (> <)    Your IP has been logged             |
+|                                                  |
+|     ╔══════════════════════════════════╗         |
+|     ║  Your hacking skills:            ║         |
+|     ║  [#-------------------] 1 %      ║         |
+|     ║  Keep trying, maybe next decade  ║         |
+|     ╚══════════════════════════════════╝         |
+|        Hina ng ddos mo tanga!                    |
+|     /-----------------------------------\\       |
+|     |  You have been permanently banned |        |
+|    \\-----------------------------------/        |
+|                                                  |
++--------------------------------------------------+
+  `;
+  
+  return new Response(asciiTroll, { 
+    status: 403,
+    headers: { 
+      'Content-Type': 'text/plain',
+      'Dumb-Skid-Ip': clientIP
+    }
+  });
+}
 
       const now = Date.now();
 
