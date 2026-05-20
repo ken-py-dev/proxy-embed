@@ -437,14 +437,6 @@ async function proxyRequestToOrigin(request, clientIP, env, ctx) {
   });
 }
 
-setInterval(() => {
-  cleanMaps();
-  for (const originUrl of ORIGIN_URLS) {
-    if (!SERVERLESS_DOMAINS.some(d => originUrl.includes(d))) continue;
-    fetch(originUrl, { method: 'HEAD' }).catch(() => {});
-  }
-}, 30000);
-
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -520,6 +512,7 @@ export default {
       timestamps.push(now);
 
       const result = await proxyRequestToOrigin(request, clientIP, env, ctx);
+      ctx.waitUntil(Promise.resolve(cleanMaps()));
       return result;
     } catch (error) {
       return new Response('Internal Server Error', { 
