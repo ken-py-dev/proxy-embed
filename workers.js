@@ -1,4 +1,5 @@
 const ORIGIN_URLS = [
+  'https://anisekai.nport.link',
   'https://apiremake-production-7612.up.railway.app',
   'https://oreo-h3pv.onrender.com'
 ];
