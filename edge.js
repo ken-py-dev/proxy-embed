@@ -240,7 +240,11 @@ async function proxyRequestToOrigin(request, clientIP) {
       url.protocol = 'https:';
       url.port = '443';
       try {
-        return await fetch(url.toString(), request);
+        const response = await fetch(url.toString(), request);
+        if (response.status === 101 || response.status < 400) {
+          return response;
+        }
+        lastError = new Error(`Origin returned ${response.status}`);
       } catch (error) {
         lastError = error;
       }
@@ -295,9 +299,13 @@ async function proxyRequestToOrigin(request, clientIP) {
     fetchUrl.port = '443';
 
     try {
-      originResponse = await fetch(fetchUrl.toString(), fetchOptions);
-      lastError = null;
-      break;
+      const response = await fetch(fetchUrl.toString(), fetchOptions);
+      if (response.status < 400) {
+        originResponse = response;
+        lastError = null;
+        break;
+      }
+      lastError = new Error(`Origin returned ${response.status}`);
     } catch (error) {
       lastError = error;
     }

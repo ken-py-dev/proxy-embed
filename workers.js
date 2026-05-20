@@ -1,5 +1,6 @@
 const ORIGIN_URLS = [
   'https://apiremake-production-7612.up.railway.app',
+  'https://anisekai.nport.link',
   'https://oreo-h3pv.onrender.com/'
 ];
 
@@ -259,7 +260,11 @@ async function proxyRequestToOrigin(request, clientIP, env, ctx) {
       url.protocol = 'https:';
       url.port = '443';
       try {
-        return await fetch(url.toString(), request);
+        const response = await fetch(url.toString(), request);
+        if (response.status === 101 || response.status < 400) {
+          return response;
+        }
+        lastError = new Error(`Origin returned ${response.status}`);
       } catch (error) {
         lastError = error;
       }
@@ -324,9 +329,13 @@ async function proxyRequestToOrigin(request, clientIP, env, ctx) {
       fetchUrl.port = '443';
 
       try {
-        cachedResponse = await fetch(fetchUrl.toString(), fetchOptions);
-        lastError = null;
-        break;
+        const response = await fetch(fetchUrl.toString(), fetchOptions);
+        if (response.status < 400) {
+          cachedResponse = response;
+          lastError = null;
+          break;
+        }
+        lastError = new Error(`Origin returned ${response.status}`);
       } catch (error) {
         lastError = error;
       }
