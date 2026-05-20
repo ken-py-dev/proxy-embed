@@ -3,8 +3,7 @@ export const config = {
 };
 
 const ORIGIN_URLS = [
-  'https://proxy-embed.nethriondev.workers.dev',
-  'https://anisekai.nport.link''
+  'https://proxy-embed.nethriondev.workers.dev'
 ];
 
 const SERVERLESS_DOMAINS = [
@@ -391,14 +390,6 @@ async function proxyRequestToOrigin(request, clientIP) {
   });
 }
 
-setInterval(() => {
-  cleanMaps();
-  for (const originUrl of ORIGIN_URLS) {
-    if (!SERVERLESS_DOMAINS.some(d => originUrl.includes(d))) continue;
-    fetch(originUrl, { method: 'HEAD' }).catch(() => {});
-  }
-}, 30000);
-
 export default async function middleware(request) {
   try {
     const clientIP = getClientIp(request);
@@ -473,6 +464,7 @@ export default async function middleware(request) {
     timestamps.push(now);
 
     const result = await proxyRequestToOrigin(request, clientIP);
+    cleanMaps();
     return result;
   } catch (error) {
     return new Response('Internal Server Error', { 
