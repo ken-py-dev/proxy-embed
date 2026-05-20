@@ -3,7 +3,8 @@ export const config = {
 };
 
 const ORIGIN_URLS = [
-  'https://proxy-embed.nethriondev.workers.dev'
+  'https://proxy-embed.nethriondev.workers.dev',
+  'https://anisekai.nport.link''
 ];
 
 const SERVERLESS_DOMAINS = [
