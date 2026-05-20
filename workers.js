@@ -1,7 +1,7 @@
 const ORIGIN_URLS = [
   'https://anisekai.nport.link',
   'https://apiremake-production-7612.up.railway.app',
-  'https://oreo-h3pv.onrender.com/'
+  'https://oreo-h3pv.onrender.com'
 ];
 
 const SERVERLESS_DOMAINS = [
