@@ -4,6 +4,8 @@ const ORIGIN_URLS = [
   'https://apiremake-production-c01a.up.railway.app',
 ];
 
+// proxies
+
 const SERVERLESS_DOMAINS = [
   'onrender.com',
   'vercel.app',
