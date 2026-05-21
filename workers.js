@@ -217,8 +217,8 @@ async function tryOrigin(originUrl, targetUrl, fetchOptions) {
 }
 
 async function fetchFromFastestOrigin(url, fetchOptions) {
-  const tunnelOrigins = ORIGIN_URLS.filter(o => !o.includes('.nega'));
-  const backupOrigins = ORIGIN_URLS.filter(o => o.includes('.nega'));
+  const tunnelOrigins = ORIGIN_URLS.filter(o => !o.includes('railway.app'));
+  const backupOrigins = ORIGIN_URLS.filter(o => o.includes('railway.app'));
   
   try {
     const promises = tunnelOrigins.map(origin => tryOrigin(origin, url, fetchOptions));
