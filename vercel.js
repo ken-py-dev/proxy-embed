@@ -89,7 +89,7 @@ export default async function handler(request) {
   const cacheKey = new Request(workerUrl.toString(), cacheKeyOptions);
   
   let response = await cache.match(cacheKey);
-  let fromCache = false;
+  let fromVercelCache = false;
   
   if (!response) {
     const fetchOptions = {
@@ -107,10 +107,15 @@ export default async function handler(request) {
     
     response = await fetch(workerUrl.toString(), fetchOptions);
     
+    const cfCacheStatus = response.headers.get('cf-cache-status');
+    const workerXCache = response.headers.get('x-cache');
+    const isWorkerHit = cfCacheStatus === 'HIT' || workerXCache === 'HIT';
+    
     const contentType = response.headers.get('content-type') || '';
     const contentLength = parseInt(response.headers.get('content-length') || '0');
     const ext = url.searchParams.get('ext') || undefined;
     const cacheTtl = getCacheTtl(url, contentType, !!rangeHeader, response.status, contentLength, ext);
+    
     const shouldCache = cacheTtl > 0 && (response.status === 200 || response.status === 206);
     
     if (shouldCache) {
@@ -123,18 +128,20 @@ export default async function handler(request) {
           'Cache-Control': `public, max-age=${cacheTtl}, stale-while-revalidate=${Math.floor(cacheTtl/2)}`,
           'CDN-Cache-Control': `public, max-age=${cacheTtl}`,
           'Vercel-CDN-Cache-Control': `public, max-age=${cacheTtl}`,
-          'X-Cache': 'MISS'
+          'X-Cache': 'MISS',
+          'X-Worker-Cache': isWorkerHit ? 'HIT' : 'MISS',
+          'X-Worker-CF-Status': cfCacheStatus || 'UNKNOWN'
         }
       });
       await cache.put(cacheKey, cachedResponse);
     }
-    fromCache = false;
+    fromVercelCache = false;
   } else {
-    fromCache = true;
+    fromVercelCache = true;
   }
   
   const headers = new Headers(response.headers);
-  headers.set('X-Cache', fromCache ? 'HIT' : 'MISS');
+  headers.set('X-Vercel-Cache', fromVercelCache ? 'HIT' : 'MISS');
   headers.set('X-Upstream', 'vercel-edge');
   headers.delete('Vary');
   
