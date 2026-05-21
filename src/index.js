@@ -446,6 +446,3 @@ export default {
   }
 };
 
-export async function middleware(request) {
-  return handler(request, process.env, null);
-}
