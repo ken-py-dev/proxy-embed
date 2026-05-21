@@ -11,7 +11,7 @@
   },
   "functions": {
     "vercel.js": {
-      "runtime": "nodejs20.x",
+      "runtime": "@vercel/node@3.0.0",
       "maxDuration": 10,
       "memory": 1024
     }
