@@ -16,7 +16,7 @@ const BLOCKED_IPS = [
   '72.60.237.246'
 ];
 
-const INTERNAL_PROXY_IPS = ["162.220.234.134"];
+const INTERNAL_PROXY_IPS = new Set(["162.220.234.134"]);
 
 const CACHE_CONFIG = {
   SEGMENT_TTL: 86400,
@@ -226,12 +226,25 @@ async function fetchFromFastestOrigin(url, fetchOptions) {
 
 async function fetchWebSocketFromFastestOrigin(request) {
   const promises = ORIGIN_URLS.map(async (originUrl) => {
-    const url = new URL(request.url);
-    url.hostname = new URL(originUrl).hostname;
-    url.protocol = 'https:';
-    url.port = '443';
+    const wsUrl = new URL(request.url);
+    wsUrl.hostname = new URL(originUrl).hostname;
+    wsUrl.protocol = 'https:';
+    wsUrl.port = '443';
 
-    const response = await fetch(url.toString(), request);
+    const wsHeaders = new Headers(request.headers);
+    wsHeaders.delete('connection');
+    wsHeaders.delete('upgrade');
+    wsHeaders.delete('sec-websocket-key');
+    wsHeaders.delete('sec-websocket-version');
+    wsHeaders.delete('sec-websocket-extensions');
+    wsHeaders.delete('sec-websocket-accept');
+
+    const response = await fetch(wsUrl.toString(), {
+      method: request.method,
+      headers: wsHeaders,
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
+      duplex: 'half'
+    });
     if (response.status === 101 || response.status < 500) {
       return response;
     }
@@ -246,10 +259,10 @@ async function fetchWebSocketFromFastestOrigin(request) {
 }
 
 async function getCache() {
-  if (typeof caches !== 'undefined' && caches.open) {
+  if (typeof caches !== 'undefined' && typeof caches.open === 'function') {
     return await caches.open('proxy-cache');
   }
-  return caches.default;
+  return null;
 }
 
 async function proxyRequestToOrigin(request, clientIP, ctx) {
@@ -289,8 +302,12 @@ async function proxyRequestToOrigin(request, clientIP, ctx) {
     cacheKeyOptions.headers = { Range: rangeHeader };
   }
   const cacheKey = new Request(url.toString(), cacheKeyOptions);
-  let cachedResponse = await cache.match(cacheKey);
+  let cachedResponse = null;
   let fromCache = false;
+  
+  if (cache) {
+    cachedResponse = await cache.match(cacheKey);
+  }
   
   if (cachedResponse && !noCache) {
     fromCache = true;
@@ -317,6 +334,7 @@ async function proxyRequestToOrigin(request, clientIP, ctx) {
 
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       fetchOptions.body = request.body;
+      fetchOptions.duplex = 'half';
     }
 
     try {
@@ -330,7 +348,11 @@ async function proxyRequestToOrigin(request, clientIP, ctx) {
 
     for (const originUrl of ORIGIN_URLS) {
       if (!SERVERLESS_DOMAINS.some(d => originUrl.includes(d))) continue;
-      const promise = fetch(originUrl, { method: 'HEAD' }).catch(() => {});
+      const warmUrl = new URL(url.toString());
+      warmUrl.hostname = new URL(originUrl).hostname;
+      warmUrl.protocol = 'https:';
+      warmUrl.port = '443';
+      const promise = fetch(warmUrl.toString(), { method: 'HEAD' }).catch(() => {});
       if (ctx && ctx.waitUntil) {
         ctx.waitUntil(promise);
       }
@@ -360,8 +382,6 @@ async function proxyRequestToOrigin(request, clientIP, ctx) {
   const ext = url.searchParams.get('ext') || undefined;
   const cacheTtl = getCacheTtl(url, contentType, !!rangeHeader, cachedResponse.status, contentLength, ext);
   const shouldCache = cacheTtl > 0 && (cachedResponse.status === 200 || cachedResponse.status === 206);
-  const isMedia = pathname.match(/\.(ts|m4s|mp4|webm|avi|mov|mkv|mp3|wav|ogg|m4a|flac|aac|m3u8|mpd)$/i);
-
   if (shouldCache) {
     resHeaders.set('Cache-Control', `public, max-age=${cacheTtl}, stale-while-revalidate=${Math.floor(cacheTtl/2)}`);
     resHeaders.set('CDN-Cache-Control', `public, max-age=${cacheTtl}`);
@@ -376,24 +396,27 @@ async function proxyRequestToOrigin(request, clientIP, ctx) {
     resHeaders.delete('Vary');
   }
 
+  const responseForCache = shouldCache && !noCache && !fromCache ? cachedResponse.clone() : null;
+
   const finalResponse = new Response(cachedResponse.body, {
     status: cachedResponse.status,
     statusText: cachedResponse.statusText,
     headers: resHeaders
   });
 
-  if (shouldCache && !noCache && !fromCache) {
-    const cacheResponse = new Response(cachedResponse.body, {
-      status: cachedResponse.status,
-      statusText: cachedResponse.statusText,
-      headers: {
-        ...resHeaders,
-        'Cache-Control': `max-age=${cacheTtl}`,
-        'CDN-Cache-Control': `max-age=${cacheTtl}`,
-        'Cloudflare-CDN-Cache-Control': `max-age=${cacheTtl}`
-      }
+  if (responseForCache && cache) {
+    const cacheHeaders = new Headers(resHeaders);
+    cacheHeaders.set('Cache-Control', `max-age=${cacheTtl}`);
+    cacheHeaders.set('CDN-Cache-Control', `max-age=${cacheTtl}`);
+    cacheHeaders.set('Cloudflare-CDN-Cache-Control', `max-age=${cacheTtl}`);
+
+    const cacheResponse = new Response(responseForCache.body, {
+      status: responseForCache.status,
+      statusText: responseForCache.statusText,
+      headers: cacheHeaders
     });
-    const putPromise = cache.put(cacheKey, cacheResponse.clone()).catch((e) => console.error('cache.put failed:', e));
+
+    const putPromise = cache.put(cacheKey, cacheResponse).catch((e) => console.error('cache.put failed:', e));
     if (ctx && ctx.waitUntil) {
       ctx.waitUntil(putPromise);
     } else {
@@ -411,10 +434,7 @@ async function handler(request, env, ctx) {
     
     recordPathRequest(clientIP, url.pathname);
     
-    const trustedIps = new Set();
-    const internalProxyIpsSet = new Set(INTERNAL_PROXY_IPS);
-    
-    if (trustedIps.has(clientIP) || internalProxyIpsSet.has(clientIP)) {
+    if (INTERNAL_PROXY_IPS.has(clientIP)) {
       return await proxyRequestToOrigin(request, clientIP, ctx);
     }
 
