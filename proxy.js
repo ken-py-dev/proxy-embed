@@ -2,60 +2,11 @@ export const config = { runtime: 'edge' };
 
 const WORKER_URL = 'https://proxy-embed.nethriondev.workers.dev';
 
-const FORBIDDEN_HEADERS = new Set([
-  'host',
-  'cookie',
-  'set-cookie',
-  'origin',
-  'referer',
-  'authorization',
-  'proxy-authorization',
-  'proxy-authenticate',
-  'transfer-encoding',
-  'connection',
-  'keep-alive',
-  'upgrade',
-  'via',
-  'x-forwarded-for',
-  'x-forwarded-host',
-  'x-forwarded-proto',
-  'cf-connecting-ip',
-  'cf-ray',
-  'cf-worker',
-  'x-real-ip',
-]);
-
 const PROXY_TIMEOUT_MS = 15_000;
 
-const CORS_PREFLIGHT_RESPONSE = new Response(null, {
-  status: 204,
-  headers: {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, HEAD, PATCH',
-    'Access-Control-Allow-Headers': 'Content-Type, Accept, X-Stream, Range, Cache-Control',
-    'Access-Control-Max-Age': '86400',
-  }
-});
-
-function filterHeaders(headers) {
-  const filtered = new Headers();
-  for (const [key, value] of headers) {
-    if (!FORBIDDEN_HEADERS.has(key.toLowerCase())) {
-      filtered.set(key, value);
-    }
-  }
-  return filtered;
-}
-
 export default async function handler(request) {
-  if (request.method === 'OPTIONS') {
-    return CORS_PREFLIGHT_RESPONSE;
-  }
-
   const url = new URL(request.url);
   const workerUrl = new URL(url.pathname + url.search, WORKER_URL);
-
-  const filteredHeaders = filterHeaders(request.headers);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS);
@@ -63,7 +14,7 @@ export default async function handler(request) {
   try {
     const fetchOptions = {
       method: request.method,
-      headers: filteredHeaders,
+      headers: request.headers,
       signal: controller.signal,
     };
 
@@ -74,12 +25,7 @@ export default async function handler(request) {
 
     const response = await fetch(workerUrl.toString(), fetchOptions);
 
-    const responseHeaders = new Headers();
-    for (const [key, value] of response.headers) {
-      if (!FORBIDDEN_HEADERS.has(key.toLowerCase())) {
-        responseHeaders.set(key, value);
-      }
-    }
+    const responseHeaders = new Headers(response.headers);
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('Access-Control-Expose-Headers', '*');
 
