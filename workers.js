@@ -213,39 +213,40 @@ async function tryOrigin(originUrl, targetUrl, fetchOptions) {
 
   try {
     const response = await fetch(fetchUrl.toString(), fetchOptions);
+    
+    if (response.status === 403 || response.status === 1003) {
+      return { response: null, origin: originUrl, success: false, error: 'Blocked by Cloudflare' };
+    }
+    
+    if (response.ok || response.status === 206 || response.status === 304) {
+      return { response, origin: originUrl, success: true };
+    }
+    
     if (response.status < 500) {
       return { response, origin: originUrl, success: true };
     }
+    
     return { response: null, origin: originUrl, success: false, error: `HTTP ${response.status}` };
   } catch (error) {
+    if (error.message.includes('1003') || error.message.includes('blocked')) {
+      return { response: null, origin: originUrl, success: false, error: 'Origin blocked by Cloudflare' };
+    }
     return { response: null, origin: originUrl, success: false, error: error.message };
   }
 }
 
 async function fetchFromFastestOrigin(url, fetchOptions) {
-  const origins = [...ORIGIN_URLS];
-  const results = [];
-  
-  for (const origin of origins) {
+  for (const origin of ORIGIN_URLS) {
     const result = await tryOrigin(origin, url, fetchOptions);
-    if (result.success) {
-      results.push(result);
-    } else {
-      console.error(`Origin ${origin} failed: ${result.error}`);
+    if (result.success && result.response) {
+      return result.response;
     }
   }
-  
-  if (results.length === 0) {
-    throw new Error('All origins failed');
-  }
-  
-  return results[0].response;
+  throw new Error('All origins failed');
 }
 
 async function fetchWebSocketFromFastestOrigin(request) {
-  const origins = [...ORIGIN_URLS];
-  
-  for (const origin of origins) {
+  for (const origin of ORIGIN_URLS) {
     try {
       const wsUrl = new URL(request.url);
       const originParsed = new URL(origin);
@@ -268,14 +269,11 @@ async function fetchWebSocketFromFastestOrigin(request) {
         duplex: 'half'
       });
       
-      if (response.status === 101 || response.status < 500) {
+      if (response.status === 101 || response.ok || response.status < 500) {
         return response;
       }
-    } catch (e) {
-      console.error(`WebSocket origin ${origin} failed:`, e.message);
-    }
+    } catch (e) {}
   }
-  
   throw new Error('All WebSocket origins failed');
 }
 
