@@ -218,6 +218,10 @@ async function tryOrigin(originUrl, targetUrl, fetchOptions) {
       return { response: null, origin: originUrl, success: false, error: 'Blocked by Cloudflare' };
     }
     
+    if (response.status === 530) {
+      return { response: null, origin: originUrl, success: false, error: 'Origin still deploying...' };
+    }
+    
     if (response.ok || response.status === 206 || response.status === 304) {
       return { response, origin: originUrl, success: true };
     }
