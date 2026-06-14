@@ -1,5 +1,7 @@
-export const runtime = 'edge';
-export const preferredRegion = ['hnd1', 'kix1', 'icn1', 'sin1', 'hkg1', 'bom1'];
+export const config = {
+  runtime: 'edge',
+  regions: ['hnd1', 'kix1', 'icn1', 'sin1', 'hkg1', 'bom1']
+};
 
 const WORKER_URL = 'https://proxy-embed.nethriondev.workers.dev';
 
