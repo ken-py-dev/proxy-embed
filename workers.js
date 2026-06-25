@@ -1,6 +1,5 @@
 const ORIGIN_URLS = [
-  'https://restapi-production-7f23.up.railway.app',
-  'http://shinkansen.proxy.rlwy.net:14510'
+  'http://gondola.proxy.rlwy.net:17168'
 ];
 
 const SERVERLESS_DOMAINS = [
